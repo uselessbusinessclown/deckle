@@ -8,7 +8,7 @@ use deckle_core::bitmap::Gray;
 use deckle_core::bootstrap;
 use deckle_core::degrade::{apply, Degradation};
 use deckle_core::doc::{self, Estimate, FileEntry};
-use deckle_core::layout::{Config, Ecc, Paper};
+use deckle_core::layout::{Config, Ecc, InkPlanes, Paper};
 use deckle_core::pdf;
 use deckle_core::raster;
 use deckle_core::sha256::hex;
@@ -34,9 +34,18 @@ OPTIONS
                    number of dots at this resolution         (default 600)
   --ecc L|M|Q|H    symbol error correction                   (default Q)
   --parity F       cross-block parity ratio, 0 to disable    (default 0.20)
+  --ink k|cmy      ink planes carrying payload               (default k)
+                   k   black only; the only mode rated for long-term
+                       storage, and what you want on laser toner
+                   cmy adds colour for roughly double the capacity.
+                       Designed in docs/PLAN.md 18, not yet built
   --format png|pdf|both                                      (default both)
-  --no-bootstrap   omit the bootstrap page (not recommended: without it
-                   the archive cannot be read except by deckle)
+  --no-bootstrap   omit the decoding documentation            (default: on)
+                   The bootstrap page carries the format, the procedure
+                   and the reference decoder as QR. Without it the sheets
+                   can only be read by deckle itself. Reasonable to drop
+                   when the pages join an archive that already has one, or
+                   when paper is scarcer than the tool.
   --out DIR        output directory
   --degrade SPEC   simulate only; comma-separated, e.g.
                    blur=0.6,noise=8,rotate=1.5,dotgain=0.15,
@@ -112,6 +121,11 @@ fn parse(args: &[String]) -> Result<Opts, String> {
                 o.cfg.ecc = Ecc::parse(&v).ok_or(format!("bad --ecc '{v}', use L M Q or H"))?;
             }
             "--parity" => o.cfg.parity_ratio = val(&mut i)?.parse().map_err(|_| "bad --parity")?,
+            "--ink" => {
+                let v = val(&mut i)?;
+                o.cfg.ink_planes =
+                    InkPlanes::parse(&v).ok_or(format!("bad --ink '{v}', use k or cmy"))?;
+            }
             "--format" => o.format = val(&mut i)?,
             "--out" => o.out = Some(PathBuf::from(val(&mut i)?)),
             "--degrade" => o.degrade = val(&mut i)?,
@@ -249,6 +263,7 @@ fn print_estimate(e: &Estimate, json: bool) {
             p.pages
         );
     }
+    println!("Ink                black only (K)");
     println!("Density provenance UNVERIFIED (chosen blind)");
     for w in &e.warnings {
         println!("Warning            {w}");

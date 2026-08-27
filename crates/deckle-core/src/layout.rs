@@ -86,6 +86,31 @@ impl fmt::Display for Ecc {
     }
 }
 
+/// Which ink planes carry payload.
+///
+/// PLAN.md section 18 specifies an optional colour mode: three binary ink planes
+/// give 3 bits per cell, not 4, because an RGB scanner takes three measurements
+/// and cannot separate a fourth. K is reserved for structure. The mode is
+/// designed but not built, so `Cmy` is rejected rather than silently ignored.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum InkPlanes {
+    /// Black only. The default, and the only mode rated for long-term storage.
+    #[default]
+    K,
+    /// Cyan, magenta and yellow. Roughly doubles capacity; not archival.
+    Cmy,
+}
+
+impl InkPlanes {
+    pub fn parse(s: &str) -> Option<InkPlanes> {
+        match s.to_ascii_lowercase().as_str() {
+            "k" | "black" | "mono" => Some(InkPlanes::K),
+            "cmy" | "cmyk" | "color" | "colour" => Some(InkPlanes::Cmy),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Paper {
     pub w_mm: f64,
@@ -120,6 +145,7 @@ pub struct Config {
     pub render_dpi: u32,
     pub ecc: Ecc,
     pub parity_ratio: f64,
+    pub ink_planes: InkPlanes,
 }
 
 impl Default for Config {
@@ -135,6 +161,7 @@ impl Default for Config {
             render_dpi: 600,
             ecc: Ecc::Q,
             parity_ratio: 0.20,
+            ink_planes: InkPlanes::K,
         }
     }
 }
@@ -144,6 +171,7 @@ pub enum LayoutError {
     CellNotIntegerDots { cell_um: u32, dpi: u32, dots: f64 },
     PageTooSmall(String),
     HeaderTooSmall { need_mm: f64, have_mm: f64 },
+    ColourNotBuilt,
 }
 
 impl fmt::Display for LayoutError {
@@ -161,6 +189,20 @@ impl fmt::Display for LayoutError {
             LayoutError::HeaderTooSmall { need_mm, have_mm } => write!(
                 f,
                 "header band needs {need_mm:.1} mm but only {have_mm:.1} mm is available"
+            ),
+            LayoutError::ColourNotBuilt => write!(
+                f,
+                "colour mode is specified but not implemented.\n\n\
+                 It is designed in full in docs/PLAN.md section 18 as v1.1 \"Chroma\": \
+                 three ink planes, 3 bits per cell, roughly double the capacity. Note \
+                 that it is CMY and not CMYK - an RGB scanner takes three measurements \
+                 and cannot separate a fourth plane, so black is reserved for the \
+                 corner markers, the descriptor and the bootstrap page.\n\n\
+                 It is also deliberately NOT rated for long-term storage: colour inks \
+                 fade unevenly and yellow goes first, so an archive you want to still \
+                 read in twenty years should stay on --ink k with laser toner.\n\n\
+                 Building it is gated on the Phase 0 colour measurements in \
+                 docs/PLAN.md section 18.15, which have not been made."
             ),
         }
     }
@@ -199,6 +241,9 @@ pub struct PageGeometry {
 
 impl PageGeometry {
     pub fn plan(cfg: &Config) -> Result<PageGeometry, LayoutError> {
+        if cfg.ink_planes != InkPlanes::K {
+            return Err(LayoutError::ColourNotBuilt);
+        }
         let (page_w, page_h) = if cfg.landscape {
             (cfg.paper.h_mm, cfg.paper.w_mm)
         } else {

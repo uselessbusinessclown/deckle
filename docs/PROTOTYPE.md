@@ -90,10 +90,14 @@ unchanged by the upgrade; only `fec.rs` changes.
 the specified archival alternative and is what is implemented.
 
 **No encryption.** `age` is specified (9.6); the descriptor carries the scheme byte and
-reserves the header field, but nothing encrypts yet.
+reserves the header field, but nothing encrypts yet. Anything sensitive must be encrypted
+before it is handed to `deckle encode` — see [USE-CASES.md](USE-CASES.md), which says so
+where people will actually read it.
 
 **No QR symbology, no colour mode.** QR is Phase 1's compatibility layer; colour is v1.1.
-Neither is started. The `Symbology` trait of PLAN.md §6 is *described* but the code calls
+Neither is started. `--ink cmy` is accepted as a flag and refused with a pointer to
+PLAN.md §18, so asking for colour tells you where it is designed rather than silently
+printing black. The `Symbology` trait of PLAN.md §6 is *described* but the code calls
 the raster path directly — the trait should be introduced when the second symbology lands,
 which is when it starts paying for itself.
 

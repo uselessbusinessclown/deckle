@@ -15,6 +15,10 @@ are absent and stops. Reconstructing them from parity needs dkl_fec.py, which
 is printed on the same bootstrap page.
 """
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the Deckle authors. Free to copy, use and republish;
+# see the LICENSE file, or https://opensource.org/licenses/MIT
+
 import sys, os, zlib, struct, hashlib, math
 
 RS_N = 255

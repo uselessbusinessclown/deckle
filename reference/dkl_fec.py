@@ -13,6 +13,10 @@ invertible, so ANY D surviving blocks of a group of D data blocks rebuild it,
 whether they are data or parity. Standard library only.
 """
 
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 the Deckle authors. Free to copy, use and republish;
+# see the LICENSE file, or https://opensource.org/licenses/MIT
+
 import sys, os, zlib, struct, hashlib
 
 GF_EXP = [0] * 512

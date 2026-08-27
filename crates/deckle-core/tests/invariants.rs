@@ -6,7 +6,7 @@
 
 use deckle_core::degrade::{apply, Degradation};
 use deckle_core::doc::{self, FileEntry};
-use deckle_core::layout::{Config, Ecc, Paper};
+use deckle_core::layout::{Config, Ecc, InkPlanes, LayoutError, Paper};
 use deckle_core::raster;
 use deckle_core::rng::Rng;
 
@@ -368,4 +368,39 @@ fn pdf_cross_reference_table_is_correct() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn black_is_the_default_and_colour_is_refused_clearly() {
+    // PLAN.md 18.8: colour is never the default, at any tier, on any medium.
+    assert_eq!(Config::default().ink_planes, InkPlanes::K);
+    assert_eq!(InkPlanes::parse("k"), Some(InkPlanes::K));
+    // CMYK is a common way to ask for it; accept the word, then explain.
+    assert_eq!(InkPlanes::parse("cmyk"), Some(InkPlanes::Cmy));
+    assert_eq!(InkPlanes::parse("sepia"), None);
+
+    let mut c = cfg(254, Ecc::Q, 0.2);
+    c.ink_planes = InkPlanes::Cmy;
+    let files = payload(1_000, 21);
+    // Every entry point must refuse, not silently print black.
+    assert!(matches!(
+        deckle_core::layout::PageGeometry::plan(&c),
+        Err(LayoutError::ColourNotBuilt)
+    ));
+    assert!(matches!(
+        doc::estimate(&c, &files),
+        Err(LayoutError::ColourNotBuilt)
+    ));
+    assert!(matches!(
+        doc::encode(&c, &files),
+        Err(LayoutError::ColourNotBuilt)
+    ));
+
+    let msg = LayoutError::ColourNotBuilt.to_string();
+    assert!(msg.contains("not implemented"), "must not imply it works");
+    assert!(msg.contains("section 18"), "must say where it is designed");
+    assert!(
+        msg.contains("not CMYK"),
+        "must explain why three planes, not four"
+    );
 }

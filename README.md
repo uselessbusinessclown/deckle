@@ -7,6 +7,28 @@ back from flatbed scans. A QR compatibility layer will cover phone cameras, tiny
 and a bootstrap page that makes every archive recoverable **without Deckle** — from the
 paper alone, plus a commodity QR reader and a Python interpreter.
 
+## What it's for
+
+Which of your files still exist after the electronics are gone? Not a failed disk — that
+is what backups are for — but a house fire that takes the NAS and the laptop, a flood, a
+lightning strike, a severe geomagnetic storm, or twenty years passing with nothing left
+that can read the medium.
+
+Paper is not clever, but it is passive: no semiconductors to damage, no charge to lose,
+no controller firmware to become unobtainable. Microfiche is denser and proven, but
+creating and reading it needs specialised equipment. Deckle's bet is that the whole
+recovery stack should be things anyone can buy, switch off and put in a drawer — **a
+flatbed scanner, a phone with a QR app, and Python** — and that the decoder should travel
+with the data, printed on the last sheet.
+
+The trade is capacity. Tens to low hundreds of kilobytes per sheet: not a file server,
+but enough for the password vault, the keys, the radio plan, the pump setpoints and the
+deeds. Photos and disk images belong on offline drives; paper holds the root of trust.
+
+**[docs/USE-CASES.md](docs/USE-CASES.md)** covers what to put on it, how to size and
+configure it, how to store it, and the limits — including the one that matters most:
+**Deckle does not encrypt anything yet, so encrypt before you print.**
+
 ## Status
 
 Working prototype. Encode, render, degrade and decode all work end to end; a file
@@ -72,6 +94,12 @@ still round-trips byte-identically.
 60,939 usable bytes per A4 sheet at 254 µm; 139,629 at 169 µm.
 
 ## Layout
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). The reference programs printed on every bootstrap page
+carry the same licence in their own headers, so whoever recovers them decades from now
+can see they are free to use.
 
 ```
 crates/deckle-core/   layout engine, encoder, decoder, FEC, bootstrap page, harness
