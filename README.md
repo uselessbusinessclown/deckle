@@ -15,6 +15,9 @@ Planning. No implementation yet.
   decisions with rationale, interfaces, capacity estimates, test matrix, risks,
   milestones. Read §0 first; it challenges the project's core density premise with
   arithmetic and defines the Phase 0 go/no-go.
+- **§18** of the same document specifies **v1.1 "Chroma"** — an optional CMY colour mode
+  that roughly doubles capacity per sheet, and is explicitly *not* rated for long-term
+  archival storage.
 
 ## Planned shape
 

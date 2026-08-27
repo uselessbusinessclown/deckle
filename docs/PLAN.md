@@ -47,6 +47,15 @@ Two other findings that change the design and are argued in full later:
   perform cross-block erasure decoding.** It handles the all-pages-present path; a second,
   optional module on the bootstrap page handles loss (§5.11, §11.2 item 10).
 
+**Colour (v1.1 "Chroma", §18)** is specified in full but held out of v1.0. The same
+arithmetic discipline applies to it: adding CMY inks raises the ceiling to 3 bits per
+cell, not 4 — an RGB scanner makes three measurements, so it cannot separate four ink
+planes — and registration error plus a stronger ECC requirement bring the *expected*
+gain to roughly **1.6–1.9×**, or **1.26×** net once colour's larger parity allowance is
+counted. It is worth building as an increment on a shipped product. It is not worth
+delaying v1.0 for, and it costs the twenty-year archival promise, which §18.8 turns into
+policy rather than a caveat.
+
 ---
 
 ## 1. Product goal
@@ -86,7 +95,11 @@ if Phase 0 goes badly — the product.
 
 ## 3. Non-goals for v1
 
-Colour or multi-level cells. An iOS app (but the format must make one trivial: the page
+Colour, which is specified separately as **v1.1 "Chroma"** (§18) and deliberately kept
+out of v1.0 so the v1.0 format can freeze without waiting on it. Multi-level or tinted
+cells remain out of scope entirely — ink levels between "absent" and "full" are precisely
+what dot gain and fading destroy first, and no amount of calibration recovers them.
+An iOS app (but the format must make one trivial: the page
 descriptor is self-describing and the QR profile is phone-readable). Phone camera as a
 reader for the native raster — phone readers are routed to QR. Anything cloud. Any
 network access at all in the core.
@@ -1096,7 +1109,9 @@ artefact frozen at v1.0. All integers are little-endian.
   73     2  render_dpi       u16
   75     2  ink_inset_um     u16
   77     1  age_header_len   u8
-  78   ...  age_header       present on EVERY page when encrypted (§9.6)
+  78     8  reserved         zero in v1.0; allocated by colour mode in §18.9
+  86   ...  age_header       present on EVERY page when encrypted (§9.6)
+                             variable length, therefore always last
 ```
 
 Every field a decoder needs is here. Nothing is user-entered at decode time.
@@ -1488,3 +1503,576 @@ rediscovered.
 Changes: nothing in v1, but it interacts with document identity and would want designing
 before the format freezes. *Answered by:* explicitly deferred, with reserved bits in the
 document header.
+
+---
+
+# 18. Colour mode — v1.1 "Chroma"
+
+An optional mode that adds cyan, magenta and yellow ink planes to the native raster.
+Specified here as a distinct version so that v1.0 can ship, and freeze its format, without
+waiting on it. Colour mode is a **capacity mode, not an archival mode**, and §18.8 makes
+that distinction binding rather than advisory.
+
+## 18.0 The honest number, first
+
+The intuitive claim is that four inks give four bits per cell and therefore 4× the
+density. Two things reduce that, and both are structural rather than incidental:
+
+**Ceiling is 3×, not 4×.** A colour scanner produces exactly three numbers per pixel
+(R, G, B). Four ink layers are four unknowns recovered from three measurements — an
+underdetermined system (§18.1). K is therefore excluded from the data alphabet, leaving
+CMY: eight states, **3 bits per cell**.
+
+**Realised gain is roughly 2×, not 3×.** Colour cells must be larger than mono cells
+because of inter-plane registration error (§18.4), and colour needs one ECC level more
+because an eight-state classifier errs more often than a two-state one (§18.2).
+
+| Scenario | Mono baseline | Colour | Gain |
+|---|---|---|---|
+| Colour holds the same cell size, same ECC | 169 µm, Q, 136.3 KiB | 169 µm, Q, 404.7 KiB | **2.97×** |
+| Colour holds cell size, one ECC level stronger | 169 µm, Q, 136.3 KiB | 169 µm, H, 334.3 KiB | **2.45×** |
+| **Expected:** one cell step coarser, one ECC level stronger | 169 µm, Q, 136.3 KiB | 212 µm, H, 213.6 KiB | **1.57×** |
+| Expected, if ECC can stay at Q | 169 µm, Q, 136.3 KiB | 212 µm, Q, 258.5 KiB | **1.90×** |
+| Pessimistic: two cell steps coarser | 254 µm, Q, 60.5 KiB | 423 µm, H, 53.5 KiB | **0.88×** |
+
+The pessimistic row is not decoration. If registration error forces colour cells two
+steps coarser, **colour is worse than mono** — three bits in a cell of nine times the area
+loses to one bit in a small cell. Colour mode lives or dies on §18.4, and Phase 0 gains a
+measurement task because of it (§18.15).
+
+Stated plainly for planning purposes: **expect colour to roughly double capacity, at the
+cost of the twenty-year archival promise.** That is a real gain and worth building. It is
+not a 4× gain, and no arrangement of the physics produces one.
+
+## 18.1 Why CMY, and why K is excluded from the data alphabet
+
+Three independent arguments, any one of which is sufficient.
+
+**Measurement count.** An RGB scanner yields three values per pixel. Recovering four
+independent ink coverages from three measurements requires the inks' spectra to be
+linearly independent in a way three broad sensor bands can separate. Carbon black is
+spectrally flat — it absorbs uniformly, so K's direction in RGB space is approximately
+(−1, −1, −1). A C+M+Y overprint is also approximately neutral, so it occupies nearly the
+same direction. The two are near-degenerate at 8 bits per channel with scanner noise.
+
+**Alphabet collapse.** Even ignoring the measurement problem: of the 16 CMYK
+combinations, the eight with K = 1 all read as near-black regardless of what lies beneath,
+because K is opaque and laid last. Sixteen combinations therefore present as at most nine
+distinguishable states, and CMY = 111 is itself near-black, collapsing to eight.
+log₂(8) = 3 bits. The fourth ink buys nothing.
+
+**Driver interference — the practical killer.** Consumer print pipelines apply grey
+component replacement: the driver detects near-neutral CMY combinations and substitutes K
+to save ink and reduce ink loading. A driver doing its job will silently rewrite our
+C+M+Y cells as K cells and, under undercolour addition, do the reverse. **This is not a
+tuning problem; it is the driver correctly destroying our encoding.** Defeating it
+requires emitting device-native separations with colour management disabled — in PDF, a
+`/DeviceN` colourspace with named colourants `[Cyan Magenta Yellow]` rather than
+`/DeviceRGB` or a managed `/DeviceCMYK`. Whether commodity macOS drivers honour that is
+an open question and a Phase 0 test (§18.15, R17).
+
+**Decision.** *Options:* CMYK four-plane; CMY three-plane; CMY plus K as a fourth
+low-confidence plane. *Choice:* **CMY three-plane, 3 bits per cell. K is reserved
+exclusively for structure** — fiducials, sync dots, the descriptor QR, the human header,
+the bootstrap page. *Rationale:* the three arguments above; and reserving K for structure
+means page location, orientation and descriptor reading all work before any colour
+calibration exists, using the same code as mono. *Reversibility:* high — `ink_planes` is a
+bitmask field in the page descriptor, so a fourth plane is a format-version bump, not a
+redesign, should someone find a way to separate it.
+
+## 18.2 State alphabet and bit mapping
+
+Eight states, one per vertex of the CMY cube. The bit mapping is the direct one:
+
+| State | c m y | Appearance | Bits |
+|---|---|---|---|
+| 0 | 0 0 0 | paper white | 000 |
+| 1 | 1 0 0 | cyan | 100 |
+| 2 | 0 1 0 | magenta | 010 |
+| 3 | 0 0 1 | yellow | 001 |
+| 4 | 1 1 0 | blue | 110 |
+| 5 | 1 0 1 | green | 101 |
+| 6 | 0 1 1 | red | 011 |
+| 7 | 1 1 1 | composite black | 111 |
+
+The direct mapping is already optimal, and deliberately so: the dominant confusion is
+"is ink *X* present or not", which is a single-ink error, and a single-ink error is
+exactly a one-bit error under this mapping. No Gray recoding is needed or wanted — an
+indirect mapping would turn one-ink confusions into multi-bit errors.
+
+**The hardest discriminations are both one bit apart,** which is the property that makes
+this work: white ↔ yellow (yellow absorbs only in blue, and blue is typically the
+noisiest scanner channel), and composite black ↔ each of blue/green/red.
+
+Yellow deserves a note. Office paper usually contains optical brightening agents that
+fluoresce blue under the scanner's lamp, raising the white point's blue value and
+*improving* white-versus-yellow separation — but by an amount that depends on the lamp's
+UV content and on how much the paper's OBAs have degraded with age. It is a contrast
+source we benefit from and must not depend on. The per-page calibration lattice (§18.5)
+measures the actual separation rather than assuming it.
+
+**Default symbol ECC for colour mode is H** (RS(255,159)), one level above mono's Q,
+because per-cell classification error rates are higher for an eight-state decision than a
+two-state one at equal optical SNR. A profile verified by round trip may drop to Q, and
+§18.0 quantifies what that is worth.
+
+## 18.3 Per-plane codeword assignment
+
+This is the most consequential design decision in colour mode after registration, and it
+has a clearly correct answer.
+
+*Options:* (a) interleave all three planes into a common codeword pool; (b) give each
+plane its own disjoint set of codewords.
+
+*Choice:* **(b) — each ink plane carries its own disjoint, contiguous run of codewords.**
+A page's `block_count` blocks are split into three equal runs assigned to C, M and Y in
+that order; each run is interleaved within its own plane by the affine permutation of
+§5.6, using plane-specific coefficients derived from the descriptor's `interleave_a`.
+
+*Rationale:* consider the characteristic colour failure — yellow fades faster than cyan
+and magenta, which is the normal behaviour of every consumer ink and toner set. Under
+option (a), a lost yellow plane puts one bit in three *wrong in every codeword*: a 33%
+symbol error rate against a 19% correction capacity at level H. Total, unrecoverable
+loss. Under option (b), a lost yellow plane erases exactly one third of the blocks and
+leaves the other two thirds pristine — which the cross-block FEC of §5.7 can rebuild
+given `parity_ratio ≥ 0.5`. The difference between the two options is the difference
+between a graceful degradation path and a cliff.
+
+The partial-fade case matters more than the total-loss case, and option (b) wins there
+too: a degraded yellow plane raises the erasure rate only within yellow's own codewords,
+where the retry ladder's erasure flagging (§5.8) absorbs it locally instead of spending
+every codeword's correction budget at once.
+
+*Consequence for the user:* colour mode's parity guidance differs from mono's. The GUI
+says so directly — *"At 50% parity, colour archives survive the complete loss of one ink
+colour. Below that, they do not."* Default `parity_ratio` in colour mode is **0.5**, not
+0.2, and that overhead is included in the estimator's sheet count.
+
+*Reversibility:* high — the split rule is implied by `ink_planes` and `block_count` in the
+descriptor; no new fields.
+
+## 18.4 Registration — the constraint that decides colour mode
+
+Ink planes do not land on top of each other. Colour laser engines expose each plane from
+a separate drum and register mechanically; inkjets lay planes from different nozzle rows,
+often on different passes and in alternating directions. Typical inter-plane registration
+error is **±0.05 mm on a well-aligned inkjet and ±0.10 mm on a colour laser**, with cheap
+units specified as loosely as ±0.15 mm.
+
+Cell sampling reads the central 50% of each cell (§5.8), so a plane displaced by more
+than 25% of the cell pitch pushes the wrong ink into the sampled region. Uncorrected,
+that sets a floor of **cell ≥ 4 × registration error**: 0.2 mm for a good inkjet, 0.4 mm
+for a typical colour laser. The 0.4 mm floor is where colour loses to mono outright
+(§18.0, pessimistic row).
+
+**Mitigation: per-plane affine correction.** Most registration error is systematic —
+a constant offset plus small scale and rotation differences between planes — and
+systematic error is measurable and removable. Each of the four corner fiducial positions
+carries, alongside the K fiducial, three small three-armed registration marks printed one
+per plane, at known offsets. Twelve marks in total yield a full affine fit per plane
+(offset, scale, rotation, shear), applied before sampling.
+
+What survives is the *local, random* component — nozzle-to-nozzle scatter, paper feed
+jitter, drum eccentricity — which is expected to be ±0.02–0.04 mm, implying a floor
+around 0.08–0.16 mm. **If that expectation holds, colour cells can sit at the same size as
+mono cells and the gain is the full 2.45–2.97×.** If it does not, colour steps one size
+coarser and the gain is 1.57–1.90×. If residual error exceeds 0.06 mm, colour mode is not
+worth building for that hardware class.
+
+That three-way branch is exactly what Phase 0 must resolve, and it is why colour is a
+separate version rather than a v1.0 feature: the measurement that decides its shape
+cannot be made before the mono ladder exists.
+
+## 18.5 On-page colour calibration
+
+An eight-state classifier needs to know where the eight states actually sit in scanner
+RGB — which depends on the printer, the ink set, the paper, the scanner's lamp and
+sensor, and the age of the page. None of these can be assumed, and the last one cannot
+even be known at encode time.
+
+**Calibration lattice.** Every 64 × 64 cells, a 4 × 4-cell patch is printed in a known
+state, cycling through all eight. Cost: 16 / 4096 = **0.39%** of cells. On A4 at 169 µm
+this places about 374 patches across the page, roughly 47 per state, giving the decoder a
+spatially resolved measurement of every state's appearance. The classifier is fitted
+locally and interpolated between patches, exactly as the sync-dot displacement field is
+(§5.8) — the same machinery, a different quantity.
+
+**Header strip.** A nine-patch strip (the eight states plus a K reference) in the header
+band, 4 mm per patch, for the coarse global fit and for human inspection.
+
+The decisive property: **the calibration patches age with the data.** A page whose yellow
+has faded 30% over fifteen years has calibration patches whose yellow has faded 30% too,
+so the classifier's decision boundaries move with the ink instead of being anchored to a
+factory assumption. This is the single mechanism that makes a colour archive readable
+after long storage at all, and it is why calibration is printed rather than stored.
+
+Total colour-specific structural overhead: 0.39% for the lattice, plus the header strip
+which sits in the already-reserved band. The structure budget rises from **2.5% to 3.5%**,
+and every capacity figure in §18.12 uses 3.5%.
+
+## 18.6 Decoder pipeline deltas
+
+Relative to §5.8, colour changes six steps and adds three:
+
+```
+  1. locate page              UNCHANGED - fiducials are K, read from luminance
+  2. resolve orientation      UNCHANGED - K markers
+  3. global homography        UNCHANGED
+  4. read descriptor QR       UNCHANGED - K; ink_planes field selects colour path
++ 4a. verify colour scan      reject greyscale scans (see below)
++ 4b. per-plane affine fit    12 corner registration marks -> 3 affine transforms
+  5. local warp               UNCHANGED (K sync dots), then applied per plane
++ 5a. fit local classifier    calibration lattice -> local RGB->(c,m,y) unmixing
+  6. adaptive threshold       REPLACED by per-plane density thresholding
+  7. sample cells             per plane, each at its own corrected position
+  8. per-cell confidence      per plane: |density - threshold| / local contrast
+  9. de-interleave            per plane, plane-specific coefficients
+ 10. RS decode                UNCHANGED - each plane's codewords decoded independently
+ 11. CRC32C verify            UNCHANGED
+ 12. report                   EXTENDED with per-plane margin and per-plane error rate
+```
+
+**Unmixing.** *Options:* nearest-centroid classification among the eight measured patch
+centroids with a Mahalanobis metric; a local 3 × 4 linear map from RGB to ink density
+followed by independent per-plane thresholds. *Choice:* **the local linear map.**
+*Rationale:* it produces three independent per-plane confidences with the same shape the
+mono pipeline already consumes, so the retry ladder, erasure flagging and reporting need
+no colour-specific code. Nearest-centroid gives a marginally better classification but
+yields a posterior over states that must then be marginalised into per-bit confidences —
+more code, in the reference decoder as much as the product, for a small gain.
+*Reversibility:* high, decoder-side only, improvable for old archives after the fact.
+
+**Greyscale-scan rejection.** A user scanning a colour archive in greyscale gets an image
+where R ≈ G ≈ B and the three planes are irrecoverably summed. This is a likely and
+completely silent failure, so it is detected explicitly: if the per-pixel channel spread
+across the calibration patches is below a threshold, the decoder refuses the page and
+says *"this page was scanned in greyscale; rescan in colour."* Colour management must
+likewise be off or a known profile embedded; an unmanaged scan with an unknown profile
+is accepted, because the calibration lattice absorbs an unknown but consistent transform.
+
+**Per-plane margin reporting** is what makes fade visible before it becomes loss. A
+recovery report reading *"cyan 22%, magenta 26%, yellow 71% of correction capacity
+consumed"* tells the user their yellow is going and they have one reprint left. The GUI
+surfaces exactly that, and it is the strongest argument for building the per-plane
+reporting properly rather than averaging.
+
+## 18.7 What stays black, always
+
+Non-negotiable, because each of these must be readable before any colour processing is
+possible, or must outlive the colour inks:
+
+- Corner fiducials and the orientation marker.
+- The sync-dot lattice.
+- The page descriptor QR.
+- The human-readable header, including the colour-mode warning.
+- The header calibration strip's K reference patch.
+- **The entire bootstrap page** (§12.5), always, without exception.
+
+A colour archive whose colour has failed completely still presents a page that locates,
+orients, and announces what it was — and a bootstrap page that explains how to read it.
+That is the difference between a degraded archive and an unidentifiable sheet of confetti.
+
+## 18.8 Archival policy
+
+Colour mode weakens the central promise of this project, and the plan should say so
+rather than bury it in a caveat.
+
+Carbon-black toner is effectively permanent: it is a fused thermoplastic carbon layer,
+chemically inert, with no known fading mechanism on a hundred-year scale. Colour is not
+in that category. Dye-based inkjet inks fade visibly in years under ambient light and can
+shift measurably in dark storage. Pigment inkjet inks are far better but fade
+*differentially*, and yellow pigments are generally the least lightfast. Colour toner is
+stable but its yellow is the weakest component and its fusing is less complete than K's.
+
+Therefore, as policy rather than guidance:
+
+1. **Colour mode is never the default,** at any density tier, on any medium.
+2. **Every colour page prints `COLOUR MODE — NOT RATED FOR LONG-TERM ARCHIVE`** in the
+   human header, in K, at the same size as the page number.
+3. **Dye inks are refused, not warned about.** `medium.ink_class = "dye"` combined with
+   `density.ink_planes = "cmy"` is a configuration error with an explanatory message, not
+   a checkbox. Pigment and toner are permitted; pigment carries a warning.
+4. **Default `parity_ratio` is 0.5** in colour mode (§18.3), so that the loss of one ink
+   is survivable rather than fatal.
+5. **The estimator reports an archival class**, not just a sheet count: `archival` for
+   K-only on laser toner and acid-free paper, `durable` for K-only otherwise,
+   `capacity` for any colour configuration. The GUI shows it beside the sheet count with
+   the same prominence as the provenance mark.
+6. **A recommended re-verification interval** is printed on colour pages: rescan within
+   five years. Because per-plane margin is reported (§18.6), re-verification is
+   informative rather than ritual — it tells the user whether their yellow is failing
+   while there is still time to reprint.
+
+The honest summary, which belongs in the user documentation verbatim: *colour roughly
+doubles what fits on a sheet, and roughly halves the number of years you should trust
+that sheet.*
+
+## 18.9 Format deltas
+
+Colour is a **format version bump to 0x0110**, backward-compatible in the direction that
+matters: a v1.1 decoder reads v1.0 archives unchanged, and a v1.0 decoder encountering
+`ink_planes ≠ 0` fails with `DKL_E_UNSUPPORTED` and a message naming the required
+version, rather than misreading the page.
+
+Page descriptor additions (§12.2), placed in the reserved region:
+
+```
+ off  size  field
+  78     1  ink_planes       bitmask: bit0=C bit1=M bit2=Y; 0 = K-only (v1.0 behaviour)
+  79     1  cal_period       u8, cells between calibration patches (64)
+  80     1  cal_patch_cells  u8, patch edge in cells (4)
+  81     1  plane_reg_spec   u8, 1 = twelve three-armed corner marks
+  82     1  colour_ecc       u8, RS k for the colour planes if it differs from rs_k
+  83     3  reserved
+  86   ...  age_header       unchanged, still last
+```
+
+These occupy the eight bytes v1.0 reserves at offset 78 (§12.2), which is why v1.0
+reserved them: a v1.0 encoder writes zeros there, and `ink_planes == 0` is exactly the
+K-only behaviour a v1.0 decoder already implements.
+
+`block_count` retains its meaning; §18.3's rule — three equal contiguous runs assigned to
+C, M, Y in order — is implied by `ink_planes` having three bits set and needs no field.
+
+Document header (§12.1) is unchanged. Colour is a page-level property, so an archive may
+in principle mix colour data pages with K-only pages; the bootstrap page always is one.
+
+## 18.10 Symbology registry
+
+§6 forbids per-symbology branches outside a plugin, and colour must not smuggle branches
+into the layout engine or estimator through a back door.
+
+*Options:* (a) a `ColorMode` parameter threaded through `Symbology::plan_region`;
+(b) a separate symbology plugin with its own id; (c) one implementation registered twice
+under two ids.
+
+*Choice:* **(c).** `raster_k` (id 1) and `raster_cmy` (id 3) are two registry entries over
+one implementation, differing in their constructor parameters.
+
+*Rationale:* the two genuinely differ in everything the registry exists to declare —
+`reader_requirements` returns a colour-capable flatbed for one and any flatbed for the
+other; `density_range` differs; default ECC differs (H versus Q); default parity ratio
+differs (0.5 versus 0.2); archival class differs. Threading a parameter (option a) would
+push those differences into every caller as conditionals, which is precisely the
+special-casing §6 exists to prevent. A wholly separate plugin (option b) would duplicate
+the 95% of code the two share. Two registrations over one implementation puts the
+differences in the registry, where the rest of the system already looks for them.
+
+`RegionPlan` gains `bits_per_unit: u8` (1 or 3), which the chunker uses and nothing else
+interprets. `SymbolDecode` gains `per_plane: Option<[PlaneReport; 3]>`, which the recovery
+report renders and nothing else interprets.
+
+*Reversibility:* high.
+
+## 18.11 Configuration deltas
+
+```toml
+[density]
+ink_planes      = "k"          # k | cmy    -- default k, never auto-selected
+
+[medium]
+ink_class       = "toner"      # toner | pigment | dye
+                               # dye + cmy is refused (18.8)
+
+[reader]
+color           = false        # required true for cmy; validated at plan time
+
+[ecc]
+symbol_level    = "Q"          # colour mode defaults to "H"
+parity_ratio    = 0.20         # colour mode defaults to 0.50 (18.3)
+
+[render]
+separations     = "devicen"    # devicen | cmyk_unmanaged
+                               # cmy only; how separations reach the driver (18.1)
+```
+
+Colour density tiers, all placeholders until Phase 0 (§18.15) replaces them:
+
+| Tier | toner (colour laser) | pigment inkjet |
+|---|---|---|
+| conservative | 339 µm | 254 µm |
+| balanced | 254 µm | 212 µm |
+| aggressive | 212 µm | 169 µm |
+
+The colour ladder starts one to two steps coarser than the mono ladder at every tier,
+which is the registration allowance of §18.4 expressed as a default. Where Phase 0 shows
+per-plane affine correction removes more error than expected, these move down.
+
+## 18.12 Capacity — colour
+
+> Same standing caveat as §13, and one more: these assume the eight states are reliably
+> separable at the stated cell size, which no measurement yet supports.
+
+Structure budget 3.5% (§18.5). 3 bits per cell. **Level H is the colour default**;
+the Q column applies only to round-trip-verified profiles.
+
+**A4, CMY**
+
+| Cell | Grid | Cells | Raw | Q | **H (default)** | vs mono Q, same cell |
+|---|---|---|---|---|---|---|
+| 169 µm | 1090 × 1456 | 1,587,040 | 581.2 KiB | 404.7 KiB | **334.3 KiB** | 2.45× |
+| 212 µm | 871 × 1164 | 1,013,844 | 371.3 KiB | 258.5 KiB | **213.6 KiB** | 2.45× |
+| 254 µm | 726 × 970 | 704,220 | 257.9 KiB | 179.6 KiB | **148.3 KiB** | 2.45× |
+| 339 µm | 544 × 727 | 395,488 | 144.8 KiB | 100.8 KiB | **83.3 KiB** | 2.45× |
+| 423 µm | 436 × 582 | 253,752 | 92.9 KiB | 64.7 KiB | **53.5 KiB** | 2.45× |
+
+**Letter, CMY**
+
+| Cell | Grid | Raw | Q | **H (default)** |
+|---|---|---|---|---|
+| 169 µm | 1125 × 1352 | 557.0 KiB | 387.9 KiB | **320.4 KiB** |
+| 212 µm | 899 × 1081 | 355.9 KiB | 247.8 KiB | **204.7 KiB** |
+| 254 µm | 749 × 901 | 247.1 KiB | 172.1 KiB | **142.2 KiB** |
+| 339 µm | 561 × 675 | 138.7 KiB | 96.6 KiB | **79.8 KiB** |
+| 423 µm | 450 × 540 | 89.0 KiB | 62.0 KiB | **51.2 KiB** |
+
+**A3, CMY**
+
+| Cell | Grid | Raw | Q | **H (default)** |
+|---|---|---|---|---|
+| 169 µm | 1604 × 2183 | 1282.3 KiB | 892.9 KiB | **737.6 KiB** |
+| 212 µm | 1282 × 1745 | 819.2 KiB | 570.5 KiB | **471.2 KiB** |
+| 254 µm | 1069 × 1455 | 569.6 KiB | 396.6 KiB | **327.6 KiB** |
+| 339 µm | 801 × 1090 | 319.7 KiB | 222.6 KiB | **183.9 KiB** |
+
+**Read these tables against §18.0, not on their own.** The last column of the A4 table is
+a same-cell-size comparison and therefore an upper bound; the operative comparison is
+mono at its best working cell size against colour at *its* best working cell size, which
+is the third row of §18.0's table and reads **1.57×**.
+
+And one number that must not be lost: at 50% parity (§18.3) versus mono's 20%, colour's
+*net* advantage after parity sheets is 1.57 × (1.20 / 1.50) = **1.26×** for an archive
+configured to survive an ink failure. Colour's headline gain and its delivered gain are
+different numbers, and the estimator shows the delivered one.
+
+## 18.13 Reference decoder impact
+
+Colour adds roughly 60–90 lines to the decode path: RGB load and channel handling, the
+per-plane affine fit from the twelve corner marks, the local unmixing fit, and per-plane
+thresholding. Added to the ~380-line mono decoder, that overruns the ~400-line budget.
+
+**Decision.** *Options:* extend `dkl_ref.py` and raise the budget; ship a third module.
+*Choice:* **`dkl_ref.py` remains mono-only and unchanged; colour archives print a third
+module, `dkl_ref_cmy.py` (~200 lines, NumPy and Pillow only), on the bootstrap page with
+its own printed SHA-256.** *Rationale:* the mono reference decoder is the artefact the
+archival promise rests on, and it must not grow to carry a mode that is explicitly not
+archival. A recoverer holding a K-only archive should never have to read past the first
+module. *Reversibility:* high — it is a separate file and a separate QR block.
+
+The bootstrap page of a colour archive therefore carries three modules. It will spill to
+two pages, which §12.5 already permits and which costs nothing worth protecting.
+
+## 18.14 Calibration ladder additions
+
+The ladder gains three colour tests, all on one additional sheet:
+
+- **Registration vernier.** A per-plane vernier pattern, readable both by eye and by
+  machine, measuring inter-plane registration error in micrometres, before and after
+  per-plane affine correction. This is the measurement that sets the colour cell size.
+- **State separability.** All eight states at each cell size in the ladder, with
+  classification error rate reported per state. Yellow-versus-white and composite-black-
+  versus-blue/green/red are reported separately, since they set the floor.
+- **Separation integrity.** A patch that is C+M+Y overprint adjacent to a patch that is
+  K, printed through the configured `render.separations` path. If the scanner cannot
+  distinguish them, the driver has applied grey component replacement and colour mode is
+  unusable on that printer (§18.1, R17). This test runs first and short-circuits the rest.
+
+## 18.15 Milestones
+
+**Phase 0 additions** (colour ladder, +1 week, run alongside the mono ladder):
+
+- Measure inter-plane registration error on both printers, raw and after per-plane affine
+  correction. **This sets the colour cell size and therefore whether colour is worth
+  building at all.**
+- Verify that a `/DeviceN` separations path survives commodity macOS drivers without grey
+  component replacement.
+- Measure eight-state classification error rates at each cell size on both paper types.
+
+**Phase 0 colour exit criteria** — all three required before Phase 6 is scheduled:
+
+1. Residual per-plane registration error after affine correction is **≤ 0.04 mm**.
+2. Separations survive the driver: C+M+Y and K are distinguishable in the scan.
+3. The measured gain over mono at each hardware's best working cell size is **≥ 1.5×**,
+   comparing like ECC and like parity.
+
+Criterion 3 is deliberately a lower bar than mono's 3× (§14), because colour is an
+increment on a shipped product rather than a premise the project rests on. If it fails,
+colour mode is dropped and nothing else changes — which is the reason it is v1.1.
+
+**Phase 6 — colour mode (5–6 weeks), after v1.0 ships.**
+
+Format v0x0110. Registry entry `raster_cmy`. Per-plane registration marks, calibration
+lattice, unmixing, per-plane codeword assignment and reporting. `/DeviceN` render path.
+Colour ladder analyzer. `dkl_ref_cmy.py`. Colour acquisition, including greyscale-scan
+rejection. GUI: colour mode with its archival-class warning and per-plane margin view.
+
+*Exit:* a colour archive round-trips through the software loop; a colour archive with the
+yellow plane fully removed recovers completely at 50% parity; and a hardware-loop print
+and scan on both Phase 0 printers meets the measured gain from criterion 3.
+
+## 18.16 Test matrix additions
+
+Added to §15.1, crossed with `{k, cmy}` and, for colour, `{169, 212, 254, 339 µm}`:
+
+| Degradation | Parameters swept |
+|---|---|
+| Per-plane registration offset | 0, 0.02, 0.04, 0.08, 0.15 mm, independent per plane, plus rotation ±0.2° |
+| Single-plane fade | 10%, 30%, 60%, 100% density loss, each plane in turn |
+| Differential fade | yellow at 2× and 4× the rate of cyan and magenta |
+| Colour cast | white point shifted ±10% per channel (scanner lamp ageing) |
+| Channel noise | blue channel at 2× and 4× the noise of red and green |
+| Greyscale scan | full channel collapse — must be *detected and refused*, not decoded wrongly |
+| Grey component replacement | C+M+Y cells rewritten as K — must be detected and reported |
+| Ink bleed across cells | 5%, 10%, 20% of cell width, per plane |
+| Scanner colour profile | unmanaged, sRGB, AdobeRGB, and a deliberately wrong profile |
+
+Added to §15.2 invariants:
+
+- **Plane loss recovers.** With `parity_ratio ≥ 0.5`, removing any one plane entirely
+  from every page recovers the archive completely — asserted, not sampled.
+- **Plane interleave is disjoint.** No codeword's bits span two planes, asserted
+  structurally at encode time. This is what §18.3 depends on and it must not decay.
+- **Greyscale refusal.** A greyscale render of a colour page produces a clear refusal,
+  never a partial or wrong decode.
+- **Mono decoder rejects colour cleanly.** A v1.0 decoder given a v1.1 colour page returns
+  `DKL_E_UNSUPPORTED` naming the version, never a misread.
+- **K structure is colour-free.** Fiducials, sync dots, descriptor QR, header and
+  bootstrap page contain no C, M or Y ink — asserted on the rendered separations.
+
+## 18.17 Risk register additions
+
+| # | Risk | Severity | Mitigation |
+|---|---|---|---|
+| R15 | **Inter-plane registration error forces colour cells so coarse that colour loses to mono** | critical | §18.4; per-plane affine correction; Phase 0 criterion 1 with a ≤ 0.04 mm threshold; colour is droppable at zero cost to v1.0. |
+| R16 | **Differential fading destroys colour archives within the promised lifetime** | critical | Colour is declared non-archival as policy (§18.8); dye inks refused; per-plane codewords give graceful degradation (§18.3); per-plane margin reporting warns before loss; 5-year re-verification printed on the page. |
+| R17 | **Printer driver grey component replacement silently rewrites C+M+Y as K** | high | `/DeviceN` separations path; separation-integrity test runs first in the ladder and short-circuits (§18.14); Phase 0 criterion 2. |
+| R18 | User scans a colour archive in greyscale and gets silent garbage | high | Explicit detection and refusal (§18.6); asserted as an invariant (§18.16). |
+| R19 | Scanner colour management alters values unpredictably between scans | medium | Calibration lattice absorbs any consistent transform (§18.5); acquisition disables management where the driver allows and records what it could not control. |
+| R20 | Yellow-on-white contrast depends on paper optical brighteners that degrade with age | medium | Contrast is measured per page from the calibration lattice rather than assumed; the lattice ages with the paper. |
+| R21 | Ink bleed on plain paper smears colour boundaries far worse than mono boundaries | medium | Colour tiers default one to two steps coarser (§18.11); Phase 0 measures on both paper types; coated stock recommended, with the specular-reflection caveat. |
+| R22 | Colour mode's complexity leaks into the v1.0 codebase before v1.0 ships | medium | Colour is v1.1 and Phase 6, after freeze; the only v1.0 accommodation is reserved descriptor bytes (§18.9). |
+
+## 18.18 Open questions
+
+**OQ-9. What is residual per-plane registration error after affine correction, on
+commodity colour hardware?** Changes: whether colour mode is worth building, and if so
+whether the gain is 1.57× or 2.45×. Ranks immediately after OQ-1 in consequence.
+*Answered by:* Phase 0 colour ladder.
+
+**OQ-10. Can grey component replacement be defeated on commodity macOS drivers?**
+Changes: binary — colour mode is impossible on printers where it cannot. *Answered by:*
+Phase 0 criterion 2. *Contingency:* if `/DeviceN` fails widely, investigate driving the
+printer through a raw PPD/PostScript path, and accept a much narrower hardware list.
+
+**OQ-11. Is a 1.26× net gain after colour's 50% parity worth the mode's complexity?**
+This is a product question, not a technical one, and §18.12 poses it deliberately. The
+counter-argument is that not every user wants ink-loss survivability: at 20% parity
+colour delivers its full ~2×, and the user who is storing a large file for five years in
+a drawer may rationally choose it. *Answered by:* a product decision before Phase 6 is
+scheduled, informed by Phase 0's measured gain.
+
+**OQ-12. Should colour mode support a mixed archive — colour data pages with a K-only
+subset carrying the most critical files?** The format already permits it (§18.9). It
+would let a user put a key or an index on archival-grade K pages and bulk data on colour
+pages. Changes: layout engine and the manifest. *Answered by:* deferred; noted so it is
+not rediscovered as a surprise.
