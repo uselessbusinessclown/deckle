@@ -442,6 +442,14 @@ and Pillow. A realistic line budget for the native raster:
 | Output, CLI | 15 |
 | **Total** | **~380** |
 
+> **Amended by implementation.** Two things changed when this was built. First, the
+> dependency budget tightened: the stock Python on a current macOS has neither NumPy nor
+> Pillow, so `dkl_ref.py` uses the standard library only and decodes PNG itself. Second,
+> the line budget did not survive that - the real decoder is 958 lines. The requirement
+> that matters is "no dependencies", not "under 400 lines"; see
+> [PROTOTYPE.md](PROTOTYPE.md) §4.7. The split below is unchanged and is what makes the
+> whole thing fit on the page at all.
+
 It fits, but only because of an amendment that must be stated plainly:
 
 > **The reference decoder does not perform cross-block erasure decoding.** It handles
@@ -1163,6 +1171,11 @@ Rendered conservatively at 0.5 mm modules (≈11.4 KiB per A4). Both modules com
 roughly 6–7 KB combined after deflate and Base45, so one page normally suffices; the
 generator spills to a second page rather than raising the density, because this page is
 the last thing standing between the user and total loss.
+
+> **Amended by implementation.** The real programs come to 11 KB after deflate, not 6–7,
+> and at 0.4 mm modules they need three A4 sheets. The symbol version and module size must
+> also adapt to the paper, or small sheets are catastrophic — see
+> [PROTOTYPE.md](PROTOTYPE.md) §4.8.
 
 ### 12.6 C ABI sketch
 

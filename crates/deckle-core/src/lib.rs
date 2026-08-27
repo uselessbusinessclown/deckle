@@ -12,13 +12,16 @@
 // state the intent more clearly than iterator adapters over zipped slices.
 #![allow(clippy::needless_range_loop)]
 
+pub mod base45;
 pub mod bitmap;
 pub mod block;
+pub mod bootstrap;
 pub mod crc;
 pub mod degrade;
 pub mod descriptor;
 pub mod doc;
 pub mod fec;
+pub mod font;
 pub mod geom;
 pub mod gf256;
 pub mod layout;

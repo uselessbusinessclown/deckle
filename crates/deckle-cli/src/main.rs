@@ -5,6 +5,7 @@
 //! tests consume, so there is only ever one code path (PLAN.md section 10).
 
 use deckle_core::bitmap::Gray;
+use deckle_core::bootstrap;
 use deckle_core::degrade::{apply, Degradation};
 use deckle_core::doc::{self, Estimate, FileEntry};
 use deckle_core::layout::{Config, Ecc, Paper};
@@ -34,6 +35,8 @@ OPTIONS
   --ecc L|M|Q|H    symbol error correction                   (default Q)
   --parity F       cross-block parity ratio, 0 to disable    (default 0.20)
   --format png|pdf|both                                      (default both)
+  --no-bootstrap   omit the bootstrap page (not recommended: without it
+                   the archive cannot be read except by deckle)
   --out DIR        output directory
   --degrade SPEC   simulate only; comma-separated, e.g.
                    blur=0.6,noise=8,rotate=1.5,dotgain=0.15,
@@ -71,6 +74,7 @@ struct Opts {
     format: String,
     degrade: String,
     verbose: bool,
+    bootstrap: bool,
     inputs: Vec<PathBuf>,
 }
 
@@ -82,6 +86,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
         format: "both".into(),
         degrade: String::new(),
         verbose: false,
+        bootstrap: true,
         inputs: Vec::new(),
     };
     let mut i = 1;
@@ -112,6 +117,7 @@ fn parse(args: &[String]) -> Result<Opts, String> {
             "--degrade" => o.degrade = val(&mut i)?,
             "--json" => o.json = true,
             "--verbose" => o.verbose = true,
+            "--no-bootstrap" => o.bootstrap = false,
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             s => o.inputs.push(PathBuf::from(s)),
         }
@@ -267,25 +273,47 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
     for p in &enc.pages {
         rendered.push(raster::render(geo, &p.cells, &p.strip));
     }
+    let boot = if o.bootstrap {
+        bootstrap::render_sheets(
+            geo,
+            &enc.pages[0].descriptor,
+            enc.pages.len(),
+            &enc.plain_sha256,
+            env!("CARGO_PKG_VERSION"),
+        )
+    } else {
+        Vec::new()
+    };
+
     if o.format != "pdf" {
         for (i, img) in rendered.iter().enumerate() {
             let path = out.join(format!("page-{:03}.png", i + 1));
             img.write_png(&path)
                 .map_err(|e| format!("{}: {e}", path.display()))?;
         }
+        for (i, img) in boot.iter().enumerate() {
+            let path = out.join(format!("bootstrap-{:03}.png", i + 1));
+            img.write_png(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
     }
     if o.format != "png" {
+        // The bootstrap sheets go last, so they end up on top when the stack is
+        // turned face up.
+        let mut all = rendered.clone();
+        all.extend(boot.iter().cloned());
         let path = out.join("archive.pdf");
-        pdf::write_pdf(&path, &rendered, geo.page_w_mm, geo.page_h_mm)
+        pdf::write_pdf(&path, &all, geo.page_w_mm, geo.page_h_mm)
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
 
     let e = doc::estimate(&o.cfg, &files).map_err(|e| e.to_string())?;
     if o.json {
         println!(
-            "{{\"pages\":{},\"doc_uuid\":\"{}\",\"plain_sha256\":\"{}\",\"out\":\"{}\",\
-\"estimate\":{}}}",
+            "{{\"pages\":{},\"bootstrap_pages\":{},\"doc_uuid\":\"{}\",\
+\"plain_sha256\":\"{}\",\"out\":\"{}\",\"estimate\":{}}}",
             enc.pages.len(),
+            boot.len(),
             hex(&enc.doc_uuid),
             hex(&enc.plain_sha256),
             out.display(),
@@ -297,13 +325,16 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
         println!("Document           {}", hex(&enc.doc_uuid[..8]));
         println!("Plaintext SHA-256  {}", hex(&enc.plain_sha256));
         println!(
-            "Wrote              {} page(s) to {}",
+            "Wrote              {} data sheet(s) + {} bootstrap sheet(s) to {}",
             enc.pages.len(),
+            boot.len(),
             out.display()
         );
-        println!();
-        println!("NOTE: this prototype does not yet generate the bootstrap page, so these");
-        println!("      sheets are not yet recoverable without deckle. See docs/PLAN.md 12.5.");
+        if boot.is_empty() {
+            println!();
+            println!("WARNING: no bootstrap page. Without it these sheets can only be read");
+            println!("         by deckle itself. Drop --no-bootstrap for a real archive.");
+        }
     }
     Ok(())
 }

@@ -8,4 +8,11 @@ description = "Paper backup: encoder, decoder, layout engine and software degrad
 
 [dependencies]
 png = "0.18"
+# Nayuki's reference QR encoder, per PLAN.md fixed decision 10.
+qrcodegen = "1.8"
 flate2 = "1"
+
+[dev-dependencies]
+# An independent QR decoder, so the bootstrap page's central claim - that a
+# commodity reader can extract the programs - is tested rather than asserted.
+rqrr = "0.10"

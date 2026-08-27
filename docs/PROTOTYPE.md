@@ -1,8 +1,9 @@
 # Deckle prototype — what is built, what it does, and what it does not
 
 This documents the first working implementation. It corresponds to **Phase 0/1** of
-[PLAN.md](PLAN.md): the format, the layout engine, the symbology, and a complete
-software round trip with a CLI. It is a prototype, not v1.0, and §4 below is an honest
+[PLAN.md](PLAN.md) plus the bootstrap page from Phase 2: the format, the layout engine,
+the symbology, a complete software round trip with a CLI, and an archive that can be read
+back **without Deckle**. It is a prototype, not v1.0, and §4 below is an honest
 list of everything it does not yet do.
 
 Pure Rust, no `unsafe`, no platform-gated code. The same crate builds and behaves
@@ -53,10 +54,20 @@ Every subcommand takes `--json`.
 | Rendering: PNG and PDF at exact physical size | complete, image-mask path |
 | Degradation harness and invariant tests | complete, 27 tests |
 | Deflate compression with a skip-if-it-does-not-pay check | complete |
+| Bootstrap page: procedure, parameters, and both reference programs as QR | complete |
+| `dkl_ref.py` and `dkl_fec.py`, standard library only | complete |
 
 **Verified end to end through a real PDF engine**: a file encoded to PDF, rasterised by
 CoreGraphics at 600 dpi, and decoded back is byte-identical, with zero error-correction
 capacity consumed.
+
+**Verified end to end without Deckle**: the QR symbols on the bootstrap page were read
+with Apple Vision - a decoder that knows nothing about this project - the recovered
+`dkl_ref.py` and `dkl_fec.py` matched the SHA-256 values printed beside them and were
+byte-identical to the files in `reference/`, and those recovered programs then rebuilt a
+three-sheet archive with one sheet destroyed. That is the archival promise, demonstrated
+rather than asserted. `tests/bootstrap.rs` runs the same check in CI using `rqrr`, an
+independent pure-Rust QR decoder.
 
 ## 3. Deviations from the specification
 
@@ -67,12 +78,9 @@ in a standard QR so a commodity reader can extract it. This prototype carries th
 96-byte payload in a low-density black-only raster strip in the header band, protected by
 RS(255,127) — 25% of the codeword correctable — with four corner markers giving it its own
 homography. The payload layout is exactly what a QR would carry, so replacing the carrier
-does not touch anything else. **Consequence: the archival promise is not yet kept.** These
-pages need Deckle to read them.
-
-**No bootstrap page.** Not generated, so `dkl_ref.py` does not exist yet and an archive is
-not recoverable without this tool. This is the single largest gap and it is called out in
-the encoder's own output.
+does not touch anything else. The bootstrap page prints the strip's geometry in words and
+`dkl_ref.py` reads it, so the archival promise still holds; what is missing is the
+convenience of a phone being able to read a data page's header directly.
 
 **Cross-block FEC is GF(2^8), not GF(2^16).** A group is capped at 255 blocks (~46 KB), so
 large documents split into several groups with pages striped across them. The interface is

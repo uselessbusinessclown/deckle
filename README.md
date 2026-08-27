@@ -9,16 +9,32 @@ paper alone, plus a commodity QR reader and a Python interpreter.
 
 ## Status
 
-Working prototype: Phase 0/1 of the plan. Encode, render, degrade and decode all work
-end to end; a file survives a whole sheet being destroyed and comes back byte-identical.
-The bootstrap page does not exist yet, so archives currently still need this tool to read
-them — see [docs/PROTOTYPE.md](docs/PROTOTYPE.md) §3.
+Working prototype. Encode, render, degrade and decode all work end to end; a file
+survives a whole sheet being destroyed and comes back byte-identical.
+
+**An archive can be read back without Deckle.** Every archive ends with a bootstrap page
+carrying, in plain language, what the format is and how to decode it — plus the complete
+source of a reference decoder as ordinary QR symbols. Recovering it needs a QR reader and
+a Python interpreter, and nothing else: the reference programs use the standard library
+only, no NumPy, no Pillow, no pip.
+
+That claim has been demonstrated, not just asserted. The QR symbols were read with Apple
+Vision, which knows nothing about this project; the recovered programs matched the
+SHA-256 printed beside them, were byte-identical to the files in `reference/`, and then
+rebuilt a three-sheet archive with one sheet destroyed. CI repeats the check on every
+commit with an independent QR decoder.
 
 ```bash
 cargo build --release
 ./target/release/deckle estimate report.pdf --cell 169 --parity 0.3
 ./target/release/deckle encode   report.pdf --out pages --parity 0.6
 ./target/release/deckle decode   pages/page-*.png --out recovered
+```
+
+Or, from the paper alone, with nothing installed:
+
+```bash
+python3 dkl_ref.py scan-*.png -o recovered
 ```
 
 `deckle simulate FILE --degrade blur=0.3,folds=2,stain=0.1` runs the whole loop in memory
@@ -58,7 +74,8 @@ still round-trips byte-identically.
 ## Layout
 
 ```
-crates/deckle-core/   layout engine, encoder, decoder, FEC, degradation harness
+crates/deckle-core/   layout engine, encoder, decoder, FEC, bootstrap page, harness
 crates/deckle-cli/    the deckle binary
+reference/            dkl_ref.py and dkl_fec.py - printed on every bootstrap page
 docs/                 plan and prototype notes
 ```

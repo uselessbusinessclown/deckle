@@ -39,3 +39,33 @@ jobs:
           ./target/release/deckle decode pages/page-*.png --out recovered
           cmp payload.bin recovered/payload.bin
           echo "recovered byte-identically after losing a sheet"
+
+      - name: Recover with the printed reference decoder, standard library only
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The archival promise: the Python programs printed on the bootstrap
+          # page must actually read the pages, with nothing installed.
+          python3 -c "import sys; print(sys.version)"
+          python3 -c "
+          import importlib.util as u
+          for m in ('numpy','PIL'):
+              assert u.find_spec(m) is None, m + ' is installed; this must run without it'
+          print('confirmed: no numpy, no Pillow')"
+          # Small paper keeps this to a minute; the bootstrap page itself is
+          # covered by tests/bootstrap.rs, which reads it with an outside decoder.
+          # Parity 0.6 over three sheets survives losing any one of them: the
+          # parity fraction 0.6/1.6 = 0.375 exceeds the 1/3 a sheet costs.
+          head -c 20000 /dev/urandom > small.bin
+          ./target/release/deckle encode small.bin --paper 105x148 --cell 254 \
+            --parity 0.6 --no-bootstrap --out sheets --format png
+          test "$(ls sheets/page-*.png | wc -l)" -ge 3
+          python3 reference/dkl_ref.py sheets/page-*.png -o ref-out
+          cmp small.bin ref-out/small.bin
+          echo "dkl_ref.py recovered the archive"
+          # Now destroy a sheet and rebuild it with the parity tool.
+          rm sheets/page-001.png
+          python3 reference/dkl_ref.py sheets/page-*.png --blocks blocks.bin -o ref-out || true
+          python3 reference/dkl_fec.py blocks.bin -o fec-out
+          cmp small.bin fec-out/small.bin
+          echo "dkl_fec.py rebuilt a destroyed sheet from parity"
