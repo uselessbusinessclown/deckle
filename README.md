@@ -112,8 +112,18 @@ The trade is capacity. Tens to low hundreds of kilobytes per sheet: not a file s
 but enough for the password vault, the keys, the radio plan, the pump setpoints and the
 deeds. Photos and disk images belong on offline drives; paper holds the root of trust.
 
-**[docs/USE-CASES.md](docs/USE-CASES.md)** covers what to put on it, how to size and
-configure it, how to store it, and the limits — including the one that matters most:
+Two situations, and they want different settings:
+
+- **[Long-term archival](docs/USE-CASE-ARCHIVAL.md)** — the machines are gone, unpowered
+  or unreadable. Black toner, enough parity to lose a whole sheet, and a bootstrap page so
+  the paper outlives the software.
+- **[Carrying data through a device inspection](docs/USE-CASE-TRANSPORT.md)** — the
+  machine can be examined, imaged or kept, and the material still has to arrive. Colour
+  for the capacity, because inks fading over decades does not matter to something that
+  lives a week. Opaque, not hidden — and the encryption is doing all the work.
+
+**[docs/USE-CASES.md](docs/USE-CASES.md)** is the shared reference: what to put on paper,
+sizing, settings, storage, and the limits — including the one that matters most:
 **Deckle does not encrypt anything yet, so encrypt before you print.**
 
 ## Using it
