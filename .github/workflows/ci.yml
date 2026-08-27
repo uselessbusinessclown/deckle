@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+      - name: Round trip through the CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release
+          head -c 60000 /dev/urandom > payload.bin
+          ./target/release/deckle estimate payload.bin --json
+          ./target/release/deckle encode payload.bin --out pages --parity 0.6
+          ./target/release/deckle inspect pages/page-001.png
+          # Destroy a whole sheet; cross-block parity must rebuild it.
+          rm pages/page-002.png
+          ./target/release/deckle decode pages/page-*.png --out recovered
+          cmp payload.bin recovered/payload.bin
+          echo "recovered byte-identically after losing a sheet"

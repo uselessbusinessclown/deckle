@@ -3,6 +3,11 @@
 **Status:** draft v0.1, pre–Phase 0. Every capacity figure in this document is a
 calculated estimate, not a measurement, and is marked as such.
 
+**A working prototype now implements Phase 0/1 of this plan.** Its calculated capacities
+are confirmed by the code, and measurement has amended three sections. See
+[PROTOTYPE.md](PROTOTYPE.md) for what is built, what deviates, and what the decoder
+actually survives.
+
 **Scope of this document:** decisions, interfaces, formats, and sequencing, at a level
 where a small team or a coding agent can execute without re-deriving them. It contains
 no implementation code.
@@ -302,6 +307,12 @@ fold of 2,910 damaged cells disperses to about 8.7 damaged *bits* per codeword. 
 successive hits on one codeword are one bit-index apart, they concentrate in one or two
 bytes — so roughly 2 byte-errors per codeword against a capacity of 32. Comfortable.
 
+> **Amended by measurement.** A single permutation over the whole page is right for a
+> thin burst and wrong for large-area loss: dispersing a 6%-of-page hole puts bad bits in
+> *every* codeword rather than destroying a few. The prototype confines the permutation to
+> 128-row bands, which raises missing-strip tolerance from 2% to 10% of page height for
+> 1.5% of capacity. See [PROTOTYPE.md](PROTOTYPE.md) §4.1.
+
 **This must be verified, not assumed.** The affine permutation's dispersion depends on
 number theory that varies with page geometry. The test harness (§15) treats burst
 tolerance as a measured property across the whole configuration matrix, and encoder
@@ -339,6 +350,12 @@ scan image
   -> 11. CRC32C verify       reject silent mis-corrections
   -> 12. emit blocks + report per-block correction counts, confidence histogram
 ```
+
+> **Amended by measurement.** Sampling the central 50% is too wide: +/-0.13 cell beats
+> +/-0.18, dropping the worst-case correction margin at 0.4-cell blur from 66% to 44% of
+> capacity. Three further decoder findings - a floor on finder size, searching rather than
+> predicting the bottom-right marker, and making both brightness tests relative - are in
+> [PROTOTYPE.md](PROTOTYPE.md) §4.4-4.6.
 
 **Warp model.** A global homography from four fiducials corrects skew and perspective but
 not paper curl or scanner-bed nonlinearity. A full thin-plate spline over ~2,750 sync

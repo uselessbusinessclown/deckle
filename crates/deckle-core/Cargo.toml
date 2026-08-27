@@ -1,0 +1,11 @@
+[package]
+name = "deckle-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Paper backup: encoder, decoder, layout engine and software degradation loop"
+
+[dependencies]
+png = "0.18"
+flate2 = "1"
