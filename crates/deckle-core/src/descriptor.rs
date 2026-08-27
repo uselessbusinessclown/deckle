@@ -14,6 +14,9 @@ use crate::layout::{Ecc, RS_N};
 
 pub const MAGIC: &[u8; 4] = b"DKLP";
 pub const FORMAT_VERSION: u16 = 0x0100;
+/// Colour pages carry a different version, so a decoder that predates colour
+/// mode refuses them by name instead of misreading them (PLAN.md 18.9).
+pub const FORMAT_VERSION_COLOUR: u16 = 0x0110;
 pub const SYMBOLOGY_RASTER_K: u16 = 1;
 pub const DESC_LEN: usize = 96;
 
@@ -47,11 +50,18 @@ pub struct Descriptor {
     pub fec_parity_blocks: u32,
     pub total_data_blocks: u32,
     pub total_blocks: u32,
-    pub payload_len: u64,
+    /// Length of the compressed stream. u32, not u64: four gigabytes is about
+    /// thirty thousand sheets, and the four bytes are worth more here.
+    pub payload_len: u32,
     pub render_dpi: u16,
     pub provenance: u8,
     pub flags: u8,
     pub band_rows: u16,
+    /// Ink planes carrying payload: 0 = black only, 0b111 = cyan/magenta/yellow.
+    pub ink_planes: u8,
+    pub cal_period: u8,
+    pub cal_patch_cells: u8,
+    pub plane_reg_spec: u8,
 }
 
 pub const COMPRESSION_NONE: u8 = 0;
@@ -105,6 +115,10 @@ impl Descriptor {
         put!(b, 72, self.total_data_blocks);
         put!(b, 76, self.total_blocks);
         put!(b, 80, self.payload_len);
+        b[84] = self.ink_planes;
+        b[85] = self.cal_period;
+        b[86] = self.cal_patch_cells;
+        b[87] = self.plane_reg_spec;
         put!(b, 88, self.render_dpi);
         b[90] = self.provenance;
         b[91] = self.flags;
@@ -142,12 +156,20 @@ impl Descriptor {
             fec_parity_blocks: get!(b, 68, u32),
             total_data_blocks: get!(b, 72, u32),
             total_blocks: get!(b, 76, u32),
-            payload_len: get!(b, 80, u64),
+            payload_len: get!(b, 80, u32),
             render_dpi: get!(b, 88, u16),
             provenance: b[90],
             flags: b[91],
             band_rows: get!(b, 92, u16),
+            ink_planes: b[84],
+            cal_period: b[85],
+            cal_patch_cells: b[86],
+            plane_reg_spec: b[87],
         })
+    }
+
+    pub fn ink(&self) -> Option<crate::layout::InkPlanes> {
+        crate::layout::InkPlanes::from_code(self.ink_planes)
     }
 
     pub fn ecc(&self) -> Option<Ecc> {
@@ -214,6 +236,10 @@ mod tests {
             provenance: PROVENANCE_BLIND,
             flags: 0,
             band_rows: 128,
+            ink_planes: 0,
+            cal_period: 0,
+            cal_patch_cells: 0,
+            plane_reg_spec: 0,
         }
     }
 

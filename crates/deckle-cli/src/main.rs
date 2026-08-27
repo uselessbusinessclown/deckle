@@ -4,9 +4,9 @@
 //! Every subcommand accepts --json and prints the same structure the GUI and the
 //! tests consume, so there is only ever one code path (PLAN.md section 10).
 
-use deckle_core::bitmap::Gray;
+use deckle_core::bitmap::Scan;
 use deckle_core::bootstrap;
-use deckle_core::degrade::{apply, Degradation};
+use deckle_core::degrade::{apply_scan_masked, Degradation};
 use deckle_core::doc::{self, Estimate, FileEntry};
 use deckle_core::layout::{Config, Ecc, InkPlanes, Paper};
 use deckle_core::pdf;
@@ -263,7 +263,14 @@ fn print_estimate(e: &Estimate, json: bool) {
             p.pages
         );
     }
-    println!("Ink                black only (K)");
+    println!(
+        "Ink                {}",
+        match e.plan.geo.ink {
+            deckle_core::layout::InkPlanes::K => "black only (K) - archival",
+            deckle_core::layout::InkPlanes::Cmy =>
+                "cyan, magenta, yellow - 3 bits per cell, NOT archival",
+        }
+    );
     println!("Density provenance UNVERIFIED (chosen blind)");
     for w in &e.warnings {
         println!("Warning            {w}");
@@ -286,7 +293,7 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
 
     let mut rendered = Vec::with_capacity(enc.pages.len());
     for p in &enc.pages {
-        rendered.push(raster::render(geo, &p.cells, &p.strip));
+        rendered.push(p.render(geo));
     }
     let boot = if o.bootstrap {
         bootstrap::render_sheets(
@@ -301,10 +308,13 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
     };
 
     if o.format != "pdf" {
-        for (i, img) in rendered.iter().enumerate() {
+        for (i, s) in rendered.iter().enumerate() {
             let path = out.join(format!("page-{:03}.png", i + 1));
-            img.write_png(&path)
-                .map_err(|e| format!("{}: {e}", path.display()))?;
+            match &s.rgb {
+                Some(c) => c.write_png(&path),
+                None => s.luma.write_png(&path),
+            }
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         }
         for (i, img) in boot.iter().enumerate() {
             let path = out.join(format!("bootstrap-{:03}.png", i + 1));
@@ -315,10 +325,8 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
     if o.format != "png" {
         // The bootstrap sheets go last, so they end up on top when the stack is
         // turned face up.
-        let mut all = rendered.clone();
-        all.extend(boot.iter().cloned());
         let path = out.join("archive.pdf");
-        pdf::write_pdf(&path, &all, geo.page_w_mm, geo.page_h_mm)
+        pdf::write_pages(&path, &rendered, &boot, geo.page_w_mm, geo.page_h_mm)
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
 
@@ -358,9 +366,9 @@ fn decode_pages(paths: &[PathBuf]) -> (Vec<raster::PageDecode>, Vec<String>) {
     let mut ok = Vec::new();
     let mut bad = Vec::new();
     for p in paths {
-        match Gray::read_png(p) {
+        match Scan::read_png(p) {
             Err(e) => bad.push(format!("{}: {e}", p.display())),
-            Ok(img) => match raster::decode_page(&img) {
+            Ok(img) => match raster::decode_scan(&img) {
                 Ok(d) => ok.push(d),
                 Err(e) => bad.push(format!("{}: {e}", p.display())),
             },
@@ -447,9 +455,10 @@ fn cmd_decode(o: &Opts) -> Result<(), String> {
 }
 
 fn cmd_inspect(o: &Opts) -> Result<(), String> {
-    let img = Gray::read_png(&o.inputs[0]).map_err(|e| e.to_string())?;
+    let scan = Scan::read_png(&o.inputs[0]).map_err(|e| e.to_string())?;
+    let img = &scan.luma;
     if o.verbose {
-        let p = raster::probe(&img);
+        let p = raster::probe(img);
         println!("Image              {} x {} px", img.w, img.h);
         println!("Global threshold   {}", p.otsu);
         println!("Finder candidates  {}", p.finders.len());
@@ -488,7 +497,7 @@ fn cmd_inspect(o: &Opts) -> Result<(), String> {
         );
         println!();
     }
-    let d = raster::decode_page(&img).map_err(|e| e.to_string())?;
+    let d = raster::decode_scan(&scan).map_err(|e| e.to_string())?;
     let de = &d.descriptor;
     if o.json {
         println!(
@@ -533,6 +542,19 @@ fn cmd_inspect(o: &Opts) -> Result<(), String> {
             d.worst_margin * 100.0
         );
         println!("Geometry residual  {:.3} cells", d.geometry_residual);
+        if let Some(reg) = d.plane_registration {
+            let m = d.plane_margin.unwrap_or([0.0; 3]);
+            let dead = d.dead_planes.unwrap_or([false; 3]);
+            println!("Ink planes         cyan, magenta, yellow");
+            for (i, name) in ["cyan", "magenta", "yellow"].iter().enumerate() {
+                println!(
+                    "  {name:<16} registration {:.2} cells, margin {:.0}% of capacity{}",
+                    reg[i],
+                    m[i] * 100.0,
+                    if dead[i] { "  - FADED BEYOND USE" } else { "" }
+                );
+            }
+        }
         if d.mirrored {
             println!("Orientation        page was mirrored; decoded flipped");
         }
@@ -550,9 +572,9 @@ fn cmd_simulate(o: &Opts) -> Result<(), String> {
     let mut decoded = Vec::new();
     let mut failed = Vec::new();
     for (i, p) in enc.pages.iter().enumerate() {
-        let img = raster::render(geo, &p.cells, &p.strip);
-        let dirty = apply(&img, &deg, cell_px);
-        match raster::decode_page(&dirty) {
+        let (clean, black) = p.render_masked(geo);
+        let dirty = apply_scan_masked(&clean, black.as_ref(), &deg, cell_px);
+        match raster::decode_scan(&dirty) {
             Ok(d) => decoded.push(d),
             Err(e) => failed.push(format!("page {}: {e}", i + 1)),
         }

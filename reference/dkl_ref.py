@@ -10,6 +10,9 @@ NOTHING but the standard library: no NumPy, no Pillow, no pip.
 Accepts 8-bit greyscale or RGB PNG, and binary PGM/PPM. Expect roughly half a
 minute per A4 page at 600 dpi; this is a last-resort tool, not a fast one.
 
+Reads black-only archives, which is what any archive meant to last should be.
+Colour pages are refused with a message rather than misread.
+
 If pages are missing or a page will not read, this decoder reports which blocks
 are absent and stops. Reconstructing them from parity needs dkl_fec.py, which
 is printed on the same bootstrap page.
@@ -677,8 +680,9 @@ def parse_descriptor(m):
         rs_n=m[52], rs_k=m[53], block_payload=m[54], seq_start=u(55, 4),
         blocks=u(59, 2), compression=m[61], encryption=m[62], fec=m[63],
         fec_data=u(64, 4), fec_parity=u(68, 4), total_data=u(72, 4),
-        total_blocks=u(76, 4), payload_len=u(80, 8), dpi=u(88, 2),
-        provenance=m[90], flags=m[91], band_rows=u(92, 2))
+        total_blocks=u(76, 4), payload_len=u(80, 4), ink_planes=m[84],
+        cal_period=m[85], cal_patch_cells=m[86], plane_reg_spec=m[87],
+        dpi=u(88, 2), provenance=m[90], flags=m[91], band_rows=u(92, 2))
 
 
 def read_descriptor(img, thr, h, aspect, span_x, unit_px):
@@ -745,6 +749,12 @@ def decode_page(img, verbose=False):
             d = read_descriptor(cur, thr, h, aspect, span_x, unit)
             if d is None:
                 continue
+            if d['ink_planes'] != 0:
+                return None, (
+                    "this page is in colour mode (three ink planes), which this\n"
+                    "  decoder does not read. Colour archives are not rated for\n"
+                    "  long-term storage for exactly this reason - use deckle, or\n"
+                    "  re-print the archive in black only.")
             if verbose:
                 sys.stderr.write("  page %d/%d, %dx%d cells, RS(255,%d)%s\n"
                                  % (d['page'] + 1, d['pages'], d['cols'], d['rows'],

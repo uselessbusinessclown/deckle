@@ -40,6 +40,20 @@ pub struct Degradation {
     /// Quarter turns clockwise.
     pub rotate_quarters: u8,
     pub seed: u64,
+
+    // ---- colour only (PLAN.md 18.16)
+    /// Per-plane registration error in cell widths, applied to C, M and Y.
+    pub reg_offset_cells: [f64; 3],
+    /// Ink density lost per plane, 0..1. 1.0 removes the plane entirely.
+    pub plane_fade: [f64; 3],
+    /// White-point shift per channel, as a fraction. Scanner lamp ageing.
+    pub colour_cast: [f64; 3],
+    /// Extra noise on the blue channel, which is the noisiest in practice.
+    pub blue_noise: f64,
+    /// Ink crosstalk: how much each ink absorbs outside its own primary.
+    pub crosstalk: f64,
+    /// Collapse all channels to luminance - a colour archive scanned in mono.
+    pub greyscale: bool,
 }
 
 impl Degradation {
@@ -74,6 +88,18 @@ impl Degradation {
                 "mirror" => d.mirror = true,
                 "quarters" => d.rotate_quarters = (num()? as i64).rem_euclid(4) as u8,
                 "seed" => d.seed = num()? as u64,
+                "reg" => d.reg_offset_cells = [num()?, -num()? * 0.6, num()? * 0.35],
+                "regc" => d.reg_offset_cells[0] = num()?,
+                "regm" => d.reg_offset_cells[1] = num()?,
+                "regy" => d.reg_offset_cells[2] = num()?,
+                "fade" => d.plane_fade = [num()?, num()?, num()?],
+                "fadec" => d.plane_fade[0] = num()?,
+                "fadem" => d.plane_fade[1] = num()?,
+                "fadey" => d.plane_fade[2] = num()?,
+                "cast" => d.colour_cast = [num()?, num()? * 0.5, -num()?],
+                "bluenoise" => d.blue_noise = num()?,
+                "crosstalk" => d.crosstalk = num()?,
+                "greyscale" | "grayscale" => d.greyscale = true,
                 other => return Err(format!("unknown degradation '{other}'")),
             }
         }
@@ -343,6 +369,118 @@ fn warp(img: &Gray, d: &Degradation, _rng: &mut Rng) -> Gray {
             } else {
                 img.sample(p.x - 0.5, p.y - 0.5)
             };
+            out.set(x, y, v.clamp(0.0, 255.0) as u8);
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------- colour
+
+use crate::bitmap::{Rgb, Scan};
+
+/// Apply a degradation to a scan, in whichever ink mode it is.
+pub fn apply_scan(scan: &Scan, d: &Degradation, cell_px: f64) -> Scan {
+    apply_scan_masked(scan, None, d, cell_px)
+}
+
+/// As `apply_scan`, told where black ink is so that ink fade leaves it alone.
+pub fn apply_scan_masked(scan: &Scan, black: Option<&Gray>, d: &Degradation, cell_px: f64) -> Scan {
+    match &scan.rgb {
+        None => Scan::grey(apply(&scan.luma, d, cell_px)),
+        Some(c) => {
+            let dirty = apply_colour(c, black, d, cell_px);
+            if d.greyscale {
+                // What a colour archive scanned in mono actually looks like: the
+                // three ink planes summed into one channel, unrecoverably.
+                Scan::grey(dirty.to_luma())
+            } else {
+                Scan::colour(dirty)
+            }
+        }
+    }
+}
+
+/// Colour degradations, then the shared geometric and optical ones per channel.
+fn apply_colour(src: &Rgb, black: Option<&Gray>, d: &Degradation, cell_px: f64) -> Rgb {
+    let mut planes: Vec<Gray> = (0..3)
+        .map(|ch| {
+            let mut g = Gray::new(src.w, src.h, 255);
+            for i in 0..src.w * src.h {
+                g.px[i] = src.px[i * 3 + ch];
+            }
+            g
+        })
+        .collect();
+
+    for ch in 0..3 {
+        // Ink fade: the paper shows through more, so the channel lightens.
+        let fade = d.plane_fade[ch].clamp(0.0, 1.0);
+        if fade > 0.0 {
+            for (i, v) in planes[ch].px.iter_mut().enumerate() {
+                if black.is_some_and(|b| b.px[i] == 0) {
+                    continue; // carbon black is a different ink and does not fade with this one
+                }
+                *v = (255.0 - (255.0 - *v as f64) * (1.0 - fade)).round() as u8;
+            }
+        }
+        // Registration: one ink lands offset from the others.
+        let off = d.reg_offset_cells[ch] * cell_px;
+        if off.abs() > 0.01 {
+            planes[ch] = shift(&planes[ch], off, off * 0.4);
+        }
+    }
+
+    // Real inks are not ideal: cyan absorbs a little green and blue, and so on.
+    if d.crosstalk > 0.0 {
+        let k = d.crosstalk.clamp(0.0, 0.6);
+        let dens: Vec<Vec<f64>> = planes
+            .iter()
+            .map(|g| g.px.iter().map(|&v| 1.0 - v as f64 / 255.0).collect())
+            .collect();
+        for ch in 0..3 {
+            for i in 0..planes[ch].px.len() {
+                let bleed: f64 = (0..3).filter(|&o| o != ch).map(|o| dens[o][i]).sum();
+                let total = (dens[ch][i] + k * bleed).min(1.0);
+                planes[ch].px[i] = (255.0 * (1.0 - total)).round() as u8;
+            }
+        }
+    }
+
+    let mut per_channel: Vec<Gray> = Vec::with_capacity(3);
+    for (ch, g) in planes.iter().enumerate() {
+        let mut sub = d.clone();
+        // Geometry must be identical across channels or the planes tear apart.
+        sub.seed = d.seed;
+        if ch == 2 && d.blue_noise > 0.0 {
+            sub.noise = (sub.noise.powi(2) + d.blue_noise.powi(2)).sqrt();
+        }
+        let mut done = apply(g, &sub, cell_px);
+        let cast = d.colour_cast[ch];
+        if cast != 0.0 {
+            for v in done.px.iter_mut() {
+                *v = (*v as f64 * (1.0 + cast)).clamp(0.0, 255.0) as u8;
+            }
+        }
+        per_channel.push(done);
+    }
+
+    let (w, h) = (per_channel[0].w, per_channel[0].h);
+    let mut out = Rgb::new(w, h, [255; 3]);
+    for i in 0..w * h {
+        for ch in 0..3 {
+            out.px[i * 3 + ch] = per_channel[ch].px[i];
+        }
+    }
+    out
+}
+
+/// Sub-pixel translation, for per-plane registration error.
+fn shift(img: &Gray, dx: f64, dy: f64) -> Gray {
+    let mut out = Gray::new(img.w, img.h, 255);
+    for y in 0..img.h {
+        for x in 0..img.w {
+            let v = img.sample(x as f64 - dx, y as f64 - dy);
             out.set(x, y, v.clamp(0.0, 255.0) as u8);
         }
     }

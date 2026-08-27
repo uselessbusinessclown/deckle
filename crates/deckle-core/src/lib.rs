@@ -16,6 +16,7 @@ pub mod base45;
 pub mod bitmap;
 pub mod block;
 pub mod bootstrap;
+pub mod colour;
 pub mod crc;
 pub mod degrade;
 pub mod descriptor;

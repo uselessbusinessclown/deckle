@@ -6,7 +6,7 @@
 
 use deckle_core::degrade::{apply, Degradation};
 use deckle_core::doc::{self, FileEntry};
-use deckle_core::layout::{Config, Ecc, InkPlanes, LayoutError, Paper};
+use deckle_core::layout::{Config, Ecc, InkPlanes, Paper};
 use deckle_core::raster;
 use deckle_core::rng::Rng;
 
@@ -39,11 +39,7 @@ fn round_trip(cfg: &Config, files: &[FileEntry], deg: &Degradation, drop: &[usiz
         if drop.contains(&i) {
             continue;
         }
-        let img = apply(
-            &raster::render(geo, &p.cells, &p.strip),
-            deg,
-            geo.cell_dots as f64,
-        );
+        let img = apply(&p.render(geo).luma, deg, geo.cell_dots as f64);
         match raster::decode_page(&img) {
             Ok(d) => decoded.push(d),
             Err(e) => failed.push(format!("page {}: {e}", i + 1)),
@@ -182,6 +178,57 @@ fn recovers_a_lost_page_at_sufficient_parity() {
 }
 
 #[test]
+fn blocks_are_spread_evenly_so_the_loss_promise_holds() {
+    // The estimator prints "any 1 of N sheets may be destroyed". That is only
+    // true if the sheets carry equal shares: filling them greedily leaves the
+    // last one nearly empty, and then losing a full sheet costs far more than
+    // 1/N of the blocks. Pick a payload that just spills onto a third sheet.
+    let c = cfg(254, Ecc::Q, 0.6);
+    let per_sheet = doc::plan(&c, 1).unwrap().blocks_per_page * 183;
+    let files = payload(per_sheet * 2 + 400, 30);
+    let plan = doc::estimate(&c, &files).unwrap().plan;
+    assert!(plan.pages >= 3, "want a barely-spilled last sheet");
+    assert!(
+        plan.blocks_per_sheet * plan.pages >= plan.total_blocks,
+        "every block must land somewhere"
+    );
+    let spare = plan.blocks_per_page - plan.blocks_per_sheet;
+    assert!(
+        spare > 0,
+        "a spilled archive should leave slack on every sheet"
+    );
+
+    let enc = doc::encode(&c, &files).unwrap();
+    let counts: Vec<usize> = enc
+        .pages
+        .iter()
+        .map(|p| p.descriptor.block_count as usize)
+        .collect();
+    // The property that matters is not that the sheets are exactly equal, but
+    // that the *fullest* one is still within the parity budget: losing it must
+    // cost each group no more than its parity can rebuild.
+    let fullest = *counts.iter().max().unwrap() as f64;
+    let share = fullest / plan.total_blocks as f64;
+    let parity_fraction = plan.group_parity as f64 / (plan.group_data + plan.group_parity) as f64;
+    assert!(
+        share <= parity_fraction,
+        "the fullest sheet holds {:.1}% of the blocks but parity covers only {:.1}% \
+         - the loss promise would be false. Counts: {counts:?}",
+        share * 100.0,
+        parity_fraction * 100.0
+    );
+
+    for lost in 0..plan.pages {
+        assert_eq!(
+            round_trip(&c, &files, &Degradation::default(), &[lost]),
+            "",
+            "losing sheet {lost} of {} must still recover",
+            plan.pages
+        );
+    }
+}
+
+#[test]
 fn reports_rather_than_guesses_when_parity_is_exhausted() {
     // Losing a sheet with no parity must fail loudly, never silently truncate.
     let c = cfg(254, Ecc::Q, 0.0);
@@ -204,7 +251,7 @@ fn rejects_pages_from_another_document() {
     let geo = &a.plan.geo;
     let mut pages = Vec::new();
     for src in [&a.pages[0], &b.pages[0]] {
-        let img = raster::render(geo, &src.cells, &src.strip);
+        let img = src.render(geo).luma;
         pages.push(raster::decode_page(&img).expect("decode"));
     }
     let err = doc::reassemble(pages).expect_err("mixed documents must be refused");
@@ -233,7 +280,7 @@ fn descriptor_carries_everything_the_decoder_needs() {
         let c = cfg(cell, ecc, 0.2);
         let files = payload(4_000, cell as u64);
         let enc = doc::encode(&c, &files).unwrap();
-        let img = raster::render(&enc.plan.geo, &enc.pages[0].cells, &enc.pages[0].strip);
+        let img = enc.pages[0].render(&enc.plan.geo).luma;
         let d = raster::decode_page(&img).expect("decode");
         assert_eq!(d.descriptor.rs_k as usize, ecc.k());
         assert_eq!(d.descriptor.grid_cols as usize, enc.plan.geo.cols);
@@ -274,11 +321,7 @@ fn pdf_cross_reference_table_is_correct() {
     let c = cfg(254, Ecc::Q, 0.0);
     let enc = doc::encode(&c, &payload(20_000, 10)).unwrap();
     let geo = &enc.plan.geo;
-    let imgs: Vec<_> = enc
-        .pages
-        .iter()
-        .map(|p| raster::render(geo, &p.cells, &p.strip))
-        .collect();
+    let imgs: Vec<_> = enc.pages.iter().map(|p| p.render(geo).luma).collect();
     assert!(imgs.len() >= 2, "want a multi-page PDF");
     deckle_core::pdf::write_pdf(&path, &imgs, geo.page_w_mm, geo.page_h_mm).unwrap();
     let bytes = std::fs::read(&path).unwrap();
@@ -371,36 +414,27 @@ fn pdf_cross_reference_table_is_correct() {
 }
 
 #[test]
-fn black_is_the_default_and_colour_is_refused_clearly() {
+fn black_is_the_default_and_colour_is_opt_in() {
     // PLAN.md 18.8: colour is never the default, at any tier, on any medium.
+    // It roughly triples capacity and is deliberately not rated for long-term
+    // storage, so it has to be asked for explicitly and by name.
     assert_eq!(Config::default().ink_planes, InkPlanes::K);
     assert_eq!(InkPlanes::parse("k"), Some(InkPlanes::K));
-    // CMYK is a common way to ask for it; accept the word, then explain.
+    assert_eq!(InkPlanes::parse("cmy"), Some(InkPlanes::Cmy));
+    // CMYK is a common way to ask for it; accept the word, since the mode it
+    // names is the closest thing on offer.
     assert_eq!(InkPlanes::parse("cmyk"), Some(InkPlanes::Cmy));
     assert_eq!(InkPlanes::parse("sepia"), None);
+    assert_eq!(InkPlanes::K.bits_per_cell(), 1);
+    assert_eq!(InkPlanes::Cmy.bits_per_cell(), 3);
 
-    let mut c = cfg(254, Ecc::Q, 0.2);
-    c.ink_planes = InkPlanes::Cmy;
-    let files = payload(1_000, 21);
-    // Every entry point must refuse, not silently print black.
-    assert!(matches!(
-        deckle_core::layout::PageGeometry::plan(&c),
-        Err(LayoutError::ColourNotBuilt)
-    ));
-    assert!(matches!(
-        doc::estimate(&c, &files),
-        Err(LayoutError::ColourNotBuilt)
-    ));
-    assert!(matches!(
-        doc::encode(&c, &files),
-        Err(LayoutError::ColourNotBuilt)
-    ));
-
-    let msg = LayoutError::ColourNotBuilt.to_string();
-    assert!(msg.contains("not implemented"), "must not imply it works");
-    assert!(msg.contains("section 18"), "must say where it is designed");
+    // A default-configured archive is black, and says so on the page.
+    let files = payload(2_000, 21);
+    let enc = doc::encode(&cfg(254, Ecc::Q, 0.2), &files).unwrap();
+    assert_eq!(enc.plan.geo.ink, InkPlanes::K);
+    assert_eq!(enc.pages[0].descriptor.ink_planes, 0);
     assert!(
-        msg.contains("not CMYK"),
-        "must explain why three planes, not four"
+        enc.pages[0].descriptor.cal_period == 0,
+        "no colour structure on a black page"
     );
 }

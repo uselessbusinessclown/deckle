@@ -20,6 +20,19 @@ pub const DESC_UNITS_ACROSS: f64 = 272.0; // strip cell = fiducial width / this
 pub const DESC_RS_K: usize = 127; // RS(255,127): corrects 64 of 255 symbols
 
 pub const SYNC_PERIOD: usize = 32; // cells between sync marks
+/// Colour calibration patches: a 4x4 square every 64 cells, offset from the sync
+/// lattice so the two never collide. 16 cells in 4096 is 0.39% (PLAN.md 18.5).
+pub const CAL_PERIOD: usize = 64;
+pub const CAL_BLOCK: usize = 4;
+pub const CAL_OFFSET: usize = 16;
+/// Per-plane registration marks sit in a strip beside each corner square, three
+/// marks of one finder-unit pitch each, one per ink (PLAN.md 18.4).
+///
+/// The strip is four units wide for a two-unit mark, so the mark keeps a full
+/// unit of white on each side. Three units left only 1.5 cells of margin, and a
+/// centroid window that reached past it into payload cells pulled the fit half a
+/// cell out - enough to put the cell-bit error rate above 10%.
+pub const REG_UNITS: usize = 4;
 /// Interleaving is confined to horizontal bands of this many cell rows.
 ///
 /// PLAN.md 5.6 specifies a single affine permutation over the whole page, which
@@ -102,6 +115,30 @@ pub enum InkPlanes {
 }
 
 impl InkPlanes {
+    /// Bits carried by one payload cell.
+    pub fn bits_per_cell(self) -> usize {
+        match self {
+            InkPlanes::K => 1,
+            InkPlanes::Cmy => 3,
+        }
+    }
+    pub fn count(self) -> usize {
+        self.bits_per_cell()
+    }
+    pub fn code(self) -> u8 {
+        match self {
+            InkPlanes::K => 0,
+            // bit0 = cyan, bit1 = magenta, bit2 = yellow (PLAN.md 18.9)
+            InkPlanes::Cmy => 0b111,
+        }
+    }
+    pub fn from_code(c: u8) -> Option<InkPlanes> {
+        match c {
+            0 => Some(InkPlanes::K),
+            0b111 => Some(InkPlanes::Cmy),
+            _ => None,
+        }
+    }
     pub fn parse(s: &str) -> Option<InkPlanes> {
         match s.to_ascii_lowercase().as_str() {
             "k" | "black" | "mono" => Some(InkPlanes::K),
@@ -171,7 +208,6 @@ pub enum LayoutError {
     CellNotIntegerDots { cell_um: u32, dpi: u32, dots: f64 },
     PageTooSmall(String),
     HeaderTooSmall { need_mm: f64, have_mm: f64 },
-    ColourNotBuilt,
 }
 
 impl fmt::Display for LayoutError {
@@ -189,20 +225,6 @@ impl fmt::Display for LayoutError {
             LayoutError::HeaderTooSmall { need_mm, have_mm } => write!(
                 f,
                 "header band needs {need_mm:.1} mm but only {have_mm:.1} mm is available"
-            ),
-            LayoutError::ColourNotBuilt => write!(
-                f,
-                "colour mode is specified but not implemented.\n\n\
-                 It is designed in full in docs/PLAN.md section 18 as v1.1 \"Chroma\": \
-                 three ink planes, 3 bits per cell, roughly double the capacity. Note \
-                 that it is CMY and not CMYK - an RGB scanner takes three measurements \
-                 and cannot separate a fourth plane, so black is reserved for the \
-                 corner markers, the descriptor and the bootstrap page.\n\n\
-                 It is also deliberately NOT rated for long-term storage: colour inks \
-                 fade unevenly and yellow goes first, so an archive you want to still \
-                 read in twenty years should stay on --ink k with laser toner.\n\n\
-                 Building it is gated on the Phase 0 colour measurements in \
-                 docs/PLAN.md section 18.15, which have not been made."
             ),
         }
     }
@@ -235,15 +257,14 @@ pub struct PageGeometry {
     /// Codewords per page.
     pub codewords: usize,
     pub ecc: Ecc,
+    pub ink: InkPlanes,
+    pub cal_patches: Vec<(usize, usize, u8)>,
     pub cell_dots: u32,
     pub render_dpi: u32,
 }
 
 impl PageGeometry {
     pub fn plan(cfg: &Config) -> Result<PageGeometry, LayoutError> {
-        if cfg.ink_planes != InkPlanes::K {
-            return Err(LayoutError::ColourNotBuilt);
-        }
         let (page_w, page_h) = if cfg.landscape {
             (cfg.paper.h_mm, cfg.paper.w_mm)
         } else {
@@ -298,10 +319,11 @@ impl PageGeometry {
             )));
         }
 
-        let sync_marks = sync_marks_for(cols, rows, fid_cells);
-        let reserved = 4 * fid_cells * fid_cells + sync_marks.len() * SYNC_BLOCK * SYNC_BLOCK;
-        let usable_cells = cols * rows - reserved;
-        let bands = bands_for(cols, rows, fid_cells, BAND_ROWS);
+        let ink = cfg.ink_planes;
+        let sync_marks = sync_marks_ink(cols, rows, fid_cells, units, ink);
+        let cal_patches = cal_patches_for(cols, rows, fid_cells, units, ink);
+        let usable_cells = usable_cells_ink(cols, rows, fid_cells, units, ink);
+        let bands = bands_ink(cols, rows, fid_cells, units, ink, BAND_ROWS);
         let codewords: usize = bands.iter().map(|b| b.codewords).sum();
 
         let geo = PageGeometry {
@@ -317,6 +339,8 @@ impl PageGeometry {
             grid_x_mm: cfg.margin_mm,
             grid_y_mm: cfg.margin_mm + header_mm,
             sync_marks,
+            cal_patches,
+            ink,
             bands,
             band_rows: BAND_ROWS,
             usable_cells,
@@ -339,6 +363,11 @@ impl PageGeometry {
 
     pub fn payload_bytes_per_page(&self) -> usize {
         self.codewords * self.ecc.payload()
+    }
+
+    /// Registration-strip origins for colour mode, in cells.
+    pub fn reg_strips(&self) -> [(usize, usize); 4] {
+        reg_strips_for(self.cols, self.rows, self.fid_cells, self.fid_unit)
     }
 
     /// Fiducial centre positions in cell coordinates, in TL, TR, BL, BR order.
@@ -416,12 +445,36 @@ pub fn in_corner(x: usize, y: usize, cols: usize, rows: usize, f: usize) -> bool
 /// Sync-mark block origins, derived from grid dimensions alone. The decoder
 /// recomputes this from the page descriptor, so encoder and decoder cannot drift.
 pub fn sync_marks_for(cols: usize, rows: usize, f: usize) -> Vec<(usize, usize)> {
+    sync_marks_ink(cols, rows, f, 0, InkPlanes::K)
+}
+
+/// As `sync_marks_for`, skipping blocks that a colour page's registration strips
+/// would overwrite. A sync mark printed under an ink mark is not a sync mark: it
+/// drags both the warp field and the mark's own centroid.
+pub fn sync_marks_ink(
+    cols: usize,
+    rows: usize,
+    f: usize,
+    unit: usize,
+    ink: InkPlanes,
+) -> Vec<(usize, usize)> {
     let mut marks = Vec::new();
     let mut sy = 0;
     while sy + SYNC_BLOCK <= rows {
         let mut sx = 0;
         while sx + SYNC_BLOCK <= cols {
-            if !in_corner(sx, sy, cols, rows, f)
+            let clash = ink != InkPlanes::K
+                && (in_reg_strip(cols, rows, f, unit, sx, sy)
+                    || in_reg_strip(
+                        cols,
+                        rows,
+                        f,
+                        unit,
+                        sx + SYNC_BLOCK - 1,
+                        sy + SYNC_BLOCK - 1,
+                    ));
+            if !clash
+                && !in_corner(sx, sy, cols, rows, f)
                 && !in_corner(sx + SYNC_BLOCK - 1, sy + SYNC_BLOCK - 1, cols, rows, f)
             {
                 marks.push((sx, sy));
@@ -433,13 +486,127 @@ pub fn sync_marks_for(cols: usize, rows: usize, f: usize) -> Vec<(usize, usize)>
     marks
 }
 
+/// Colour calibration patch origins, and the state each one prints.
+///
+/// The eight states cycle across the page so every one is measured close to
+/// every part of it. The patches age with the data, which is what lets a decoder
+/// twenty years from now find the decision boundaries where the ink actually is.
+pub fn cal_patches_for(
+    cols: usize,
+    rows: usize,
+    f: usize,
+    unit: usize,
+    ink: InkPlanes,
+) -> Vec<(usize, usize, u8)> {
+    let mut out = Vec::new();
+    if ink == InkPlanes::K {
+        return out;
+    }
+    let mut gy = 0;
+    while CAL_OFFSET + gy * CAL_PERIOD + CAL_BLOCK <= rows {
+        let mut gx = 0;
+        while CAL_OFFSET + gx * CAL_PERIOD + CAL_BLOCK <= cols {
+            let x = CAL_OFFSET + gx * CAL_PERIOD;
+            let y = CAL_OFFSET + gy * CAL_PERIOD;
+            // A patch that lands on a registration strip would be drawn over an
+            // ink mark and destroy it. Whether that happens depends on how the
+            // 64-cell lattice lines up with the strips, so it appears at some
+            // cell sizes and not others.
+            let clash = in_reg_strip(cols, rows, f, unit, x, y)
+                || in_reg_strip(cols, rows, f, unit, x + CAL_BLOCK - 1, y + CAL_BLOCK - 1);
+            if !clash
+                && !in_corner(x, y, cols, rows, f)
+                && !in_corner(x + CAL_BLOCK - 1, y + CAL_BLOCK - 1, cols, rows, f)
+            {
+                out.push((x, y, ((gx + gy * 3) % 8) as u8));
+            }
+            gx += 1;
+        }
+        gy += 1;
+    }
+    out
+}
+
+/// Registration-mark strips: (x0, y0, unit) of each corner's three-mark strip.
+/// Marks run down the strip in plane order: cyan, magenta, yellow.
+pub fn reg_strips_for(cols: usize, rows: usize, f: usize, u: usize) -> [(usize, usize); 4] {
+    let w = REG_UNITS * u;
+    [
+        (f, 0),
+        (cols - f - w, 0),
+        (f, rows - f),
+        (cols - f - w, rows - f),
+    ]
+}
+
+/// Centre of one plane's registration mark, in cell coordinates.
+///
+/// Encoder and decoder must agree on this to well under a cell, so it lives in
+/// one place: computing it twice from a description in prose cost half a cell of
+/// offset and a page of garbage.
+pub fn reg_mark_centre(sx: usize, sy: usize, unit: usize, plane: usize) -> (f64, f64) {
+    let (ox, oy) = reg_mark_origin(sx, sy, unit, plane);
+    (ox as f64 + unit as f64, oy as f64 + unit as f64)
+}
+
+/// Top-left cell of that mark's solid two-unit square. Horizontally centred in
+/// the four-unit strip; vertically the neighbours are other planes' marks, which
+/// are white in this plane's channel, so a tighter inset is safe there.
+pub fn reg_mark_origin(sx: usize, sy: usize, unit: usize, plane: usize) -> (usize, usize) {
+    (sx + unit, sy + 3 * plane * unit + unit / 2)
+}
+
+#[inline]
+fn in_reg_strip(cols: usize, rows: usize, f: usize, u: usize, x: usize, y: usize) -> bool {
+    let w = REG_UNITS * u;
+    let in_x = (x >= f && x < f + w) || (x >= cols - f - w && x < cols - f);
+    let in_y = y < f || y >= rows - f;
+    in_x && in_y
+}
+
 /// True when the cell is reserved for structure and carries no payload.
 /// Recomputes the sync-mark condition rather than searching `sync_marks`, which
 /// is stored in row-major order and is therefore not sorted by (x, y).
 #[inline]
 pub fn is_reserved_at(cols: usize, rows: usize, f: usize, x: usize, y: usize) -> bool {
+    is_reserved_ink(cols, rows, f, 0, InkPlanes::K, x, y)
+}
+
+/// As `is_reserved_at`, but also excluding the structure colour mode adds.
+#[inline]
+pub fn is_reserved_ink(
+    cols: usize,
+    rows: usize,
+    f: usize,
+    unit: usize,
+    ink: InkPlanes,
+    x: usize,
+    y: usize,
+) -> bool {
     if in_corner(x, y, cols, rows, f) {
         return true;
+    }
+    if ink != InkPlanes::K {
+        if in_reg_strip(cols, rows, f, unit, x, y) {
+            return true;
+        }
+        if x >= CAL_OFFSET
+            && y >= CAL_OFFSET
+            && (x - CAL_OFFSET) % CAL_PERIOD < CAL_BLOCK
+            && (y - CAL_OFFSET) % CAL_PERIOD < CAL_BLOCK
+        {
+            let (bx, by) = (
+                x - (x - CAL_OFFSET) % CAL_PERIOD,
+                y - (y - CAL_OFFSET) % CAL_PERIOD,
+            );
+            if bx + CAL_BLOCK <= cols
+                && by + CAL_BLOCK <= rows
+                && !in_corner(bx, by, cols, rows, f)
+                && !in_corner(bx + CAL_BLOCK - 1, by + CAL_BLOCK - 1, cols, rows, f)
+            {
+                return true;
+            }
+        }
     }
     if x % SYNC_PERIOD < SYNC_BLOCK && y % SYNC_PERIOD < SYNC_BLOCK {
         let (bx, by) = (x - x % SYNC_PERIOD, y - y % SYNC_PERIOD);
@@ -469,6 +636,22 @@ pub struct Band {
 /// Bands for a grid, derived from descriptor fields alone so the encoder and the
 /// decoder cannot disagree.
 pub fn bands_for(cols: usize, rows: usize, f: usize, band_rows: usize) -> Vec<Band> {
+    bands_ink(cols, rows, f, 0, InkPlanes::K, band_rows)
+}
+
+/// Bands for a grid. In colour mode a band's codewords divide evenly across the
+/// three ink planes, because a plane owns its codewords outright (PLAN.md 18.3):
+/// a faded plane then erases one third of the blocks instead of putting a wrong
+/// bit in every one of them.
+pub fn bands_ink(
+    cols: usize,
+    rows: usize,
+    f: usize,
+    unit: usize,
+    ink: InkPlanes,
+    band_rows: usize,
+) -> Vec<Band> {
+    let planes = ink.count();
     let mut out = Vec::new();
     let mut first_cw = 0usize;
     let mut r = 0usize;
@@ -477,12 +660,13 @@ pub fn bands_for(cols: usize, rows: usize, f: usize, band_rows: usize) -> Vec<Ba
         let mut cells = 0usize;
         for y in r..r1 {
             for x in 0..cols {
-                if !is_reserved_at(cols, rows, f, x, y) {
+                if !is_reserved_ink(cols, rows, f, unit, ink, x, y) {
                     cells += 1;
                 }
             }
         }
-        let codewords = cells / (RS_N * 8);
+        // Per plane, then multiplied back up: every plane gets the same count.
+        let codewords = (cells / (RS_N * 8)) * planes;
         out.push(Band {
             row0: r,
             row1: r1,
@@ -506,8 +690,20 @@ pub fn band_interleave(band: &Band, index: usize, seed: u32) -> (u64, u64) {
 
 /// Usable payload cells for a grid, from descriptor fields alone.
 pub fn usable_cells_for(cols: usize, rows: usize, f: usize) -> usize {
-    let sync = sync_marks_for(cols, rows, f).len();
-    cols * rows - 4 * f * f - sync * SYNC_BLOCK * SYNC_BLOCK
+    usable_cells_ink(cols, rows, f, 0, InkPlanes::K)
+}
+
+pub fn usable_cells_ink(cols: usize, rows: usize, f: usize, unit: usize, ink: InkPlanes) -> usize {
+    let mut n = 0;
+    for y in 0..rows {
+        for x in 0..cols {
+            if !is_reserved_ink(cols, rows, f, unit, ink, x, y) {
+                n += 1;
+            }
+        }
+    }
+    let _ = sync_marks_for(cols, rows, f);
+    n
 }
 
 /// Interleave multiplier: coprime to the cell count so the map is a bijection,

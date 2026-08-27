@@ -56,6 +56,7 @@ Every subcommand takes `--json`.
 | Deflate compression with a skip-if-it-does-not-pay check | complete |
 | Bootstrap page: procedure, parameters, and both reference programs as QR | complete |
 | `dkl_ref.py` and `dkl_fec.py`, standard library only | complete |
+| Colour mode: three ink planes, per-plane codewords, calibration lattice | complete |
 
 **Verified end to end through a real PDF engine**: a file encoded to PDF, rasterised by
 CoreGraphics at 600 dpi, and decoded back is byte-identical, with zero error-correction
@@ -94,10 +95,14 @@ reserves the header field, but nothing encrypts yet. Anything sensitive must be 
 before it is handed to `deckle encode` — see [USE-CASES.md](USE-CASES.md), which says so
 where people will actually read it.
 
-**No QR symbology, no colour mode.** QR is Phase 1's compatibility layer; colour is v1.1.
-Neither is started. `--ink cmy` is accepted as a flag and refused with a pointer to
-PLAN.md §18, so asking for colour tells you where it is designed rather than silently
-printing black. The `Symbology` trait of PLAN.md §6 is *described* but the code calls
+**No QR symbology.** QR is Phase 1's compatibility layer for phone cameras and tiny
+payloads. It is not started; the bootstrap page uses QR, but as a carrier for the
+reference programs rather than through the symbology interface.
+
+**Colour has no reference decoder.** `dkl_ref.py` reads black archives and *refuses*
+colour pages with a message rather than misreading them. That is a deliberate pairing
+with PLAN.md §18.8: colour is not rated for long-term storage, so the archival path
+covers the archival mode. A colour archive needs Deckle. The `Symbology` trait of PLAN.md §6 is *described* but the code calls
 the raster path directly — the trait should be introduced when the second symbology lands,
 which is when it starts paying for itself.
 
@@ -178,6 +183,21 @@ are in cell widths, so they mean the same thing at any density.
 | Perspective | 1.2% corner displacement | flatbeds have essentially none |
 | Whole sheet destroyed | yes, at sufficient parity | asserted for every sheet position |
 
+**Colour**, same page and ECC, at 50% parity:
+
+| Degradation | Survives to |
+|---|---|
+| Gaussian blur | 0.30 cell widths |
+| Additive noise | 40 grey levels |
+| Ink crosstalk (non-ideal inks) | 0.4 |
+| Per-plane misregistration | 0.5 cell widths |
+| Illumination gradient | 60% |
+| Colour cast (lamp ageing) | 35% |
+| Extra blue-channel noise | 40 grey levels |
+| Yellow fade | 90% of density |
+| An ink plane gone entirely | recovered at 50% parity |
+| Scanned in greyscale | refused, by name |
+
 **Performance**, release build, one A4 sheet at 254 µm (704,220 cells): encode and render
 ~0.2 s, decode ~0.3 s.
 
@@ -193,3 +213,53 @@ In the order that retires the most risk:
 3. **Phase 0 on real hardware.** Everything above is a software loop. The go/no-go
    measurement of PLAN.md §14 — the density ratio over QR on a real printer and scanner —
    has not been made, and it gates the native raster's existence.
+
+**4.9 Colour reaches the full 3x ceiling, and the structure it needs is nearly free.**
+PLAN.md §18.0 predicted 2.45-2.97x at equal cell size after the registration marks and
+calibration lattice were paid for. Measured across A4, Letter and A6 at four cell sizes,
+the ratio is **2.91 to 3.00**: the added structure costs about 0.5% of cells, which the
+per-band codeword rounding mostly absorbs. The 3x ceiling itself is not negotiable - it
+is what an RGB scanner's three measurements allow.
+
+That is the software-loop number. The plan's *expected* 1.57-1.90x assumed colour would
+need a coarser cell and a stronger ECC on real hardware, and nothing here refutes that:
+the measured blur tolerance is 0.30 cell widths against black's 0.45, which is exactly
+the kind of margin loss that forces a coarser cell. Colour's real gain is still a Phase 0
+question.
+
+**4.10 Four bugs in colour mode were all geometry, and all in the same class.** Each was
+two pieces of code deriving the same physical quantity separately and disagreeing:
+
+- The registration mark's centre, computed once in the encoder and once in the decoder,
+  differed by half a cell through integer rounding. Now `reg_mark_centre` is the single
+  definition both call.
+- The per-plane transform was fitted straight to the mark positions, so it absorbed the
+  local sync warp near the corners - and adding the warp again then double-counted it,
+  drifting the sampling point by a third of a cell by the bottom of the page. The plane
+  term has to be a *delta from the already-warped* black position.
+- Sync marks overlapped the registration strips and were overprinted by the ink marks,
+  poisoning both the warp field and the marks' own centroids.
+- Calibration patches could land on a registration strip and overwrite a mark. Whether
+  they did depended on how the 64-cell lattice lined up with the strips, so it appeared
+  at 169 µm and not at 254 or 127.
+
+The lesson is worth recording because it will recur: **anything both sides of the format
+compute independently is a bug waiting to happen.** The cheap defence was the diagnostic
+that found all four - dumping the encoder's cells and counting per-band, per-plane
+cell-bit errors against them. Reasoning about the symptoms was slower and wrong twice.
+
+**4.11 The degradation harness had to learn that black is a different ink.** Modelling a
+dead magenta plane by lightening the green channel also erased the black corner markers,
+because a rendered C+M+Y overprint and a K cell are the same pixels - as they are to a
+real scanner. But carbon black does not fade when magenta does, so the renderer now
+reports where K ink went and the fade model leaves it alone. Without that, the headline
+plane-loss test failed for a reason that has nothing to do with the format.
+
+**4.12 Sheets must carry equal shares, or the loss promise is false.** The encoder filled
+sheets greedily, so the last one could be nearly empty — and then losing a *full* sheet
+cost far more than its 1/N share of the blocks. `deckle estimate` was printing "any 1 of
+3 sheets may be destroyed or missing" for an archive where that was not true. Blocks are
+now spread evenly across the sheets, and a test asserts the arithmetic the promise rests
+on: the fullest sheet's share must not exceed the parity fraction. This affected black
+archives too; colour only made it show up, because tripling the capacity per sheet makes
+the last-sheet remainder a much larger fraction of the whole.

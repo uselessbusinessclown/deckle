@@ -16,8 +16,9 @@
 //! rotation; a mirrored page is caught by the descriptor failing to decode and
 //! retried flipped.
 
-use crate::bitmap::{Gray, Integral};
+use crate::bitmap::{Gray, Integral, Scan};
 use crate::block::{decode_codeword, Block, BlockDecode, BlockError, FILLER_INDEX, FLAG_FILLER};
+use crate::colour::{self, PLANE_CHANNEL};
 use crate::descriptor::Descriptor;
 use crate::geom::{Homography, Point};
 use crate::gf256::{rs_decode, rs_encode_parity};
@@ -114,6 +115,22 @@ fn draw_finders(cells: &mut [bool], cols: usize, rows: usize, f: usize, u: usize
                     }
                 }
             }
+        }
+    }
+}
+
+/// Paint the black structure - finders and sync marks - into a cell buffer that
+/// uses one byte per cell. Colour pages share exactly this structure, which is
+/// what lets page location and orientation run before any colour calibration.
+pub(crate) fn draw_structure(cells: &mut [u8], geo: &PageGeometry, ink: u8) {
+    let mut tmp = vec![false; geo.cols * geo.rows];
+    draw_finders(&mut tmp, geo.cols, geo.rows, geo.fid_cells, geo.fid_unit);
+    for &(bx, by) in &geo.sync_marks {
+        draw_sync(&mut tmp, geo.cols, bx, by);
+    }
+    for (i, on) in tmp.iter().enumerate() {
+        if *on {
+            cells[i] = ink;
         }
     }
 }
@@ -224,6 +241,14 @@ pub fn render(geo: &PageGeometry, cells: &[bool], strip: &[bool]) -> Gray {
 #[derive(Debug)]
 pub struct PageDecode {
     pub descriptor: Descriptor,
+    /// Fraction of correction capacity consumed, per ink plane. Colour only.
+    /// This is what makes a fading plane visible before it becomes loss.
+    pub plane_margin: Option<[f64; 3]>,
+    /// Mean measured registration offset per ink plane, in cells. Colour only.
+    pub plane_registration: Option<[f64; 3]>,
+    /// Ink planes whose density was too low to model - a plane that has faded
+    /// away. Its codewords are handed to cross-block parity.
+    pub dead_planes: Option<[bool; 3]>,
     pub blocks: Vec<BlockDecode>,
     /// Codewords on this page that no amount of retrying recovered.
     pub erased: usize,
@@ -239,6 +264,8 @@ pub enum DecodeError {
     NoFinders(usize),
     NoDescriptor,
     BadDescriptor(String),
+    ScannedInGreyscale,
+    ColourFitFailed(&'static str),
 }
 
 impl std::fmt::Display for DecodeError {
@@ -254,34 +281,41 @@ impl std::fmt::Display for DecodeError {
                 "could not read the descriptor strip in either orientation"
             ),
             DecodeError::BadDescriptor(s) => write!(f, "descriptor rejected: {s}"),
+            DecodeError::ScannedInGreyscale => write!(
+                f,
+                "this is a colour archive but the scan has no colour in it. Rescan in \
+                 colour, 24-bit RGB, with colour correction and auto-tone off. A \
+                 greyscale scan sums the three ink planes together and cannot be undone."
+            ),
+            DecodeError::ColourFitFailed(s) => write!(
+                f,
+                "could not fit the colour model: {s}. The calibration patches or the \
+                 registration marks were not readable; check the scan is in colour, in \
+                 focus, and not colour-managed into a different space."
+            ),
         }
     }
 }
 
+/// Decode a page from a greyscale scan. Colour archives need `decode_scan`.
 pub fn decode_page(img: &Gray) -> Result<PageDecode, DecodeError> {
-    match decode_oriented(img, false) {
+    decode_scan(&Scan::grey(img.clone()))
+}
+
+pub fn decode_scan(scan: &Scan) -> Result<PageDecode, DecodeError> {
+    match decode_oriented(scan, false) {
         Ok(d) => Ok(d),
         Err(DecodeError::NoDescriptor) | Err(DecodeError::NoFinders(_)) => {
             // A mirrored page still shows three finders but the descriptor is
             // unreadable, so the flip retry is the cheapest disambiguation.
-            let flipped = mirror(img);
-            decode_oriented(&flipped, true)
+            decode_oriented(&scan.mirrored(), true)
         }
         Err(e) => Err(e),
     }
 }
 
-fn mirror(img: &Gray) -> Gray {
-    let mut out = Gray::new(img.w, img.h, 255);
-    for y in 0..img.h {
-        for x in 0..img.w {
-            out.set(img.w - 1 - x, y, img.get(x, y));
-        }
-    }
-    out
-}
-
-fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError> {
+fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeError> {
+    let img = &scan.luma;
     let thr = otsu(img);
     let finders = find_finders(img, thr);
     if finders.len() < 3 {
@@ -324,6 +358,10 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
     if cols <= f || rows <= f || desc.sync_period as usize != SYNC_PERIOD {
         return Err(DecodeError::BadDescriptor("implausible grid".into()));
     }
+    let ink = desc
+        .ink()
+        .ok_or(DecodeError::BadDescriptor("unknown ink planes".into()))?;
+    let unit = f / 9;
 
     let cell_px = span_x / (cols - f) as f64;
     let cell_uv = |cx: f64, cy: f64| {
@@ -334,7 +372,7 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
     };
 
     // Local warp: measure each sync mark's true position and interpolate between.
-    let marks = sync_marks_for(cols, rows, f);
+    let marks = sync_marks_ink(cols, rows, f, unit, ink);
     let nx = cols.div_ceil(SYNC_PERIOD);
     let ny = rows.div_ceil(SYNC_PERIOD);
     let mut disp = vec![None; nx * ny];
@@ -390,7 +428,7 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
     } else {
         desc.band_rows as usize
     };
-    let bands = bands_for(cols, rows, f, band_rows);
+    let bands = bands_ink(cols, rows, f, unit, ink, band_rows);
     let n: usize = bands.iter().map(|b| b.codewords).sum();
     if n == 0 {
         return Err(DecodeError::BadDescriptor("no codewords fit".into()));
@@ -399,39 +437,107 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
     let mut conf = vec![vec![f32::MAX; RS_N]; n];
     let mut wh = Whitener::new(WHITEN_SEED_DATA ^ desc.page_index as u64);
     let half = (cell_px * 2.0).max(2.0);
+    let planes = ink.count();
+
+    // Colour mode needs a colour scan, per-plane geometry, and an ink model
+    // fitted from the page's own calibration patches (PLAN.md 18.4-18.6).
+    let colour_ctx = if ink != InkPlanes::K {
+        let rgb = scan.rgb.as_ref().ok_or(DecodeError::ScannedInGreyscale)?;
+        if rgb.channel_spread() < 4.0 {
+            return Err(DecodeError::ScannedInGreyscale);
+        }
+        // Black geometry first, sync warp included; the ink planes are measured
+        // as departures from it.
+        let warped = |cx: f64, cy: f64| {
+            let p = h_uv2img.apply(cell_uv(cx, cy));
+            let d = lookup(cx - 0.5, cy - 0.5);
+            Point::new(p.x + d.0, p.y + d.1)
+        };
+        let pw = colour::plane_warp(rgb, &warped, cols, rows, f, unit, cell_px)
+            .ok_or(DecodeError::ColourFitFailed("registration marks not found"))?;
+        let white = colour::WhiteMap::new(rgb, (cell_px * 8.0).max(16.0) as usize);
+        let patches = cal_patches_for(cols, rows, f, unit, ink);
+        let pos = |plane: usize, cx: f64, cy: f64| {
+            let base = warped(cx, cy);
+            let d = pw.at(plane, cx, cy);
+            Point::new(base.x + d.0, base.y + d.1)
+        };
+        let cal = colour::calibrate(rgb, cols, &patches, &pos, white, cell_px)
+            .ok_or(DecodeError::ColourFitFailed("calibration patches unusable"))?;
+        Some((rgb, pw, cal))
+    } else {
+        None
+    };
 
     for (bi_idx, band) in bands.iter().enumerate() {
+        let per_plane = band.codewords / planes;
+        let used = per_plane * RS_N * 8;
+        let a = choose_interleave_a(band.cells) as u64;
         let (ba, bb) = band_interleave(band, bi_idx, desc.interleave_seed);
-        let used = band.codewords * RS_N * 8;
-        let mut p: usize = 0;
+        let mut i: usize = 0;
         for y in band.row0..band.row1 {
             for x in 0..cols {
-                if is_reserved_at(cols, rows, f, x, y) {
+                if is_reserved_ink(cols, rows, f, unit, ink, x, y) {
                     continue;
                 }
-                let pp = ((ba * p as u64 + bb) % band.cells as u64) as usize;
-                let white = wh.next_bit();
-                p += 1;
-                if pp >= used || band.codewords == 0 {
-                    continue;
-                }
-                let base = h_uv2img.apply(cell_uv(x as f64 + 0.5, y as f64 + 0.5));
+                let base = cell_uv(x as f64 + 0.5, y as f64 + 0.5);
                 let d = lookup(x as f64, y as f64);
-                let (px, py) = (base.x + d.0, base.y + d.1);
-                let (v, s) = sample_cell(img, px, py, cell_px);
-                let (m, sd) = integral.stats(px, py, half);
-                let t = m * (1.0 + SAUVOLA_K * (sd / SAUVOLA_R - 1.0));
-                let bit = (v < t) ^ white;
-                let strength = ((v - t).abs() / sd.max(6.0)) as f32 - (s / 64.0) as f32;
+                let idx = i;
+                i += 1;
 
-                let cw = band.first_cw + pp % band.codewords;
-                let bit_i = pp / band.codewords;
-                if bit {
-                    cws[cw][bit_i / 8] |= 1 << (7 - (bit_i % 8));
+                // Read every plane of this cell, then place the bits.
+                let mut bits = [false; 3];
+                let mut strengths = [0.0f32; 3];
+                match &colour_ctx {
+                    None => {
+                        let p0 = h_uv2img.apply(base);
+                        let (px, py) = (p0.x + d.0, p0.y + d.1);
+                        let (v, sp) = sample_cell(img, px, py, cell_px);
+                        let (m, sd) = integral.stats(px, py, half);
+                        let t = m * (1.0 + SAUVOLA_K * (sd / SAUVOLA_R - 1.0));
+                        bits[0] = v < t;
+                        strengths[0] = ((v - t).abs() / sd.max(6.0)) as f32 - (sp / 64.0) as f32;
+                    }
+                    Some((rgb, pw, cal)) => {
+                        let p0 = h_uv2img.apply(base);
+                        let (bx, by) = (p0.x + d.0, p0.y + d.1);
+                        let mut dens = [0.0f64; 3];
+                        let mut dmean = [0.0f64; 3];
+                        for p in 0..3 {
+                            let (dx, dy) = pw.at(p, x as f64 + 0.5, y as f64 + 0.5);
+                            let at = Point::new(bx + dx, by + dy);
+                            dens[p] = cal.density_at(rgb, PLANE_CHANNEL[p], at, cell_px);
+                            dmean[p] = cal.mean_density_at(PLANE_CHANNEL[p], at);
+                        }
+                        let (b, c) = cal.decide(dens, dmean);
+                        bits = b;
+                        for p in 0..3 {
+                            strengths[p] = c[p] as f32;
+                        }
+                    }
                 }
-                let e = &mut conf[cw][bit_i / 8];
-                if strength < *e {
-                    *e = strength;
+
+                for p in 0..planes {
+                    let pp = if planes == 1 {
+                        ((ba * idx as u64 + bb) % band.cells as u64) as usize
+                    } else {
+                        let off =
+                            colour::plane_offset_pub(desc.interleave_seed, bi_idx, p, band.cells);
+                        ((a * idx as u64 + off) % band.cells as u64) as usize
+                    };
+                    let bit = bits[p] ^ wh.next_bit();
+                    if pp >= used || per_plane == 0 {
+                        continue;
+                    }
+                    let cw = band.first_cw + p * per_plane + pp % per_plane;
+                    let bit_i = pp / per_plane;
+                    if bit {
+                        cws[cw][bit_i / 8] |= 1 << (7 - (bit_i % 8));
+                    }
+                    let e = &mut conf[cw][bit_i / 8];
+                    if strengths[p] < *e {
+                        *e = strengths[p];
+                    }
                 }
             }
         }
@@ -441,14 +547,26 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
     let nsym = ecc.nsym();
     let mut blocks = Vec::new();
     let mut erased = 0usize;
+    let mut plane_worst = [0.0f64; 3];
+    let plane_of = |cw: usize| -> usize {
+        if planes == 1 {
+            return 0;
+        }
+        for band in &bands {
+            if cw >= band.first_cw && cw < band.first_cw + band.codewords {
+                let per = band.codewords / planes;
+                return ((cw - band.first_cw) / per.max(1)).min(2);
+            }
+        }
+        0
+    };
     for i in 0..n {
         let mut order: Vec<usize> = (0..RS_N).collect();
         order.sort_by(|&x, &y| conf[i][x].partial_cmp(&conf[i][y]).unwrap());
         let mut done = None;
         for &frac in &[0.0f64, 0.02, 0.05, 0.10, 0.20, 0.35] {
             let take = ((RS_N as f64 * frac).round() as usize).min(nsym);
-            let er = &order[..take];
-            match decode_codeword(&cws[i], ecc, er) {
+            match decode_codeword(&cws[i], ecc, &order[..take]) {
                 Ok(d) => {
                     done = Some(d);
                     break;
@@ -457,9 +575,19 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
             }
         }
         match done {
-            Some(d) if !d.block.is_filler() => blocks.push(d),
-            Some(_) => {}
-            None => erased += 1,
+            Some(d) => {
+                let pl = plane_of(i);
+                if d.margin > plane_worst[pl] {
+                    plane_worst[pl] = d.margin;
+                }
+                if !d.block.is_filler() {
+                    blocks.push(d);
+                }
+            }
+            None => {
+                erased += 1;
+                plane_worst[plane_of(i)] = 1.0;
+            }
         }
     }
 
@@ -470,6 +598,11 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
         blocks.iter().map(|b| b.margin).sum::<f64>() / blocks.len() as f64
     };
     Ok(PageDecode {
+        plane_margin: if planes == 3 { Some(plane_worst) } else { None },
+        plane_registration: colour_ctx
+            .as_ref()
+            .map(|(_, pw, _)| pw.mean_offset_cells(cell_px)),
+        dead_planes: colour_ctx.as_ref().map(|(_, _, c)| c.dead),
         descriptor: desc,
         blocks,
         erased,
@@ -487,7 +620,7 @@ fn decode_oriented(img: &Gray, mirrored: bool) -> Result<PageDecode, DecodeError
 /// models, a tighter aperture is better: at 0.4-cell blur the worst-case
 /// correction margin drops from 66% to 44% of capacity going from +/-0.18 to
 /// +/-0.13 cell. Narrower still gains nothing and costs noise immunity.
-fn sample_cell(img: &Gray, px: f64, py: f64, cell_px: f64) -> (f64, f64) {
+pub(crate) fn sample_cell(img: &Gray, px: f64, py: f64, cell_px: f64) -> (f64, f64) {
     let o = cell_px * 0.13;
     let pts = [(0.0, 0.0), (-o, -o), (o, -o), (-o, o), (o, o)];
     let mut vs = [0.0f64; 5];
@@ -551,7 +684,7 @@ fn read_descriptor(
 }
 
 /// Darkness-weighted centroid inside a window; `None` if the window is blank.
-fn refine_dark(img: &Gray, at: Point, radius: f64) -> Option<Point> {
+pub(crate) fn refine_dark(img: &Gray, at: Point, radius: f64) -> Option<Point> {
     let r = radius.max(1.0);
     let x0 = ((at.x - r).floor().max(0.0)) as usize;
     let y0 = ((at.y - r).floor().max(0.0)) as usize;

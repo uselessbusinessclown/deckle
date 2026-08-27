@@ -96,11 +96,17 @@ the total sheet count: half for a three-sheet archive, a fifth for a six-sheet o
 missing"* — and that line is the one to read. It covers fire, water, a torn page and an
 envelope going missing, not just exotic failures.
 
-**Ink.** Leave it at the default `--ink k`. Colour would roughly double capacity and is
-specified in [PLAN.md](PLAN.md) §18, but it is not built, and it is deliberately not
-rated for long-term storage: colour inks and toners fade unevenly and yellow goes first,
-so the decision boundaries drift. Black toner is fused carbon and is the most stable
-printed material there is.
+**Ink.** Leave it at the default `--ink k`. Colour (`--ink cmy`) is built and it triples
+capacity — three ink planes, three bits per cell — but it is deliberately **not rated for
+long-term storage**, and for an archive that is the whole point. Colour inks and toners
+fade unevenly and yellow goes first; black toner is fused carbon and is the most stable
+printed material there is. Colour also needs a colour scan to read back, and the
+reference decoder printed on the bootstrap page refuses colour pages by design, so a
+colour archive depends on Deckle in a way a black one does not.
+
+Colour earns its place when capacity matters more than decades: a large working set you
+expect to re-print every few years, on pigment ink or colour toner, verified by an actual
+round trip. If you cannot say when you will next re-print it, use black.
 
 **Documentation.** Leave the bootstrap page on. `--no-bootstrap` is there for the case
 where these sheets join a binder that already has one, or where paper is scarcer than the

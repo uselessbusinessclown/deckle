@@ -1574,6 +1574,13 @@ Stated plainly for planning purposes: **expect colour to roughly double capacity
 cost of the twenty-year archival promise.** That is a real gain and worth building. It is
 not a 4× gain, and no arrangement of the physics produces one.
 
+> **Built and measured.** Colour mode is implemented. In the software loop it reaches
+> **2.91–3.00×** at equal cell size and equal ECC — the top of the range above, because
+> the registration marks and calibration lattice cost only about 0.5% of cells. The
+> *expected* row still stands as the hardware prediction: measured blur tolerance is 0.30
+> cell widths against black's 0.45, which is the kind of margin loss that forces a coarser
+> cell on a real printer. See [PROTOTYPE.md](PROTOTYPE.md) §4.9–4.11.
+
 ## 18.1 Why CMY, and why K is excluded from the data alphabet
 
 Three independent arguments, any one of which is sufficient.

@@ -111,6 +111,14 @@ pub struct DocPlan {
     pub parity_blocks: usize,
     pub total_blocks: usize,
     pub pages: usize,
+    /// Blocks actually placed on each sheet.
+    ///
+    /// Not `blocks_per_page`, which is the sheet's capacity. Filling sheets
+    /// greedily leaves the last one nearly empty, and then losing a *full* sheet
+    /// costs far more than its share of the blocks - which quietly breaks the
+    /// "any 1 in N sheets" promise the estimator prints. Spreading the blocks
+    /// evenly makes that promise true.
+    pub blocks_per_sheet: usize,
 }
 
 /// Plan the sheet layout for a payload of known length. This is the only place
@@ -136,6 +144,7 @@ pub fn plan(cfg: &Config, payload_len: usize) -> Result<DocPlan, LayoutError> {
 
     let total_blocks = data_blocks + parity_blocks;
     let pages = total_blocks.div_ceil(blocks_per_page).max(1);
+    let blocks_per_sheet = total_blocks.div_ceil(pages);
     Ok(DocPlan {
         geo,
         payload_len,
@@ -148,6 +157,7 @@ pub fn plan(cfg: &Config, payload_len: usize) -> Result<DocPlan, LayoutError> {
         parity_blocks,
         total_blocks,
         pages,
+        blocks_per_sheet,
     })
 }
 
@@ -220,8 +230,35 @@ pub fn compress_stream(plain: &[u8]) -> (Vec<u8>, u8) {
 
 pub struct EncodedPage {
     pub descriptor: Descriptor,
-    pub cells: Vec<bool>,
+    /// One byte per cell: black-only pages use 0 or 1; colour pages carry the
+    /// ink bits of `colour::INK_*`.
+    pub cells: Vec<u8>,
     pub strip: Vec<bool>,
+}
+
+impl EncodedPage {
+    /// Render at the profile's nominal dpi, in whichever ink mode it was built for.
+    pub fn render(&self, geo: &PageGeometry) -> crate::bitmap::Scan {
+        self.render_masked(geo).0
+    }
+
+    /// Render, and report where black ink went. The degradation harness needs
+    /// that to model one ink fading without erasing the black structure too.
+    pub fn render_masked(
+        &self,
+        geo: &PageGeometry,
+    ) -> (crate::bitmap::Scan, Option<crate::bitmap::Gray>) {
+        if geo.ink == InkPlanes::K {
+            let mono: Vec<bool> = self.cells.iter().map(|&c| c != 0).collect();
+            (
+                crate::bitmap::Scan::grey(raster::render(geo, &mono, &self.strip)),
+                None,
+            )
+        } else {
+            let (rgb, k) = crate::colour::render_masked(geo, &self.cells, &self.strip);
+            (crate::bitmap::Scan::colour(rgb), Some(k))
+        }
+    }
 }
 
 pub struct Encoded {
@@ -304,8 +341,8 @@ pub fn encode(cfg: &Config, files: &[FileEntry]) -> Result<Encoded, LayoutError>
 
     let mut pages = Vec::with_capacity(p.pages);
     for pi in 0..p.pages {
-        let s = pi * p.blocks_per_page;
-        let e = ((pi + 1) * p.blocks_per_page).min(seq.len());
+        let s = (pi * p.blocks_per_sheet).min(seq.len());
+        let e = ((pi + 1) * p.blocks_per_sheet).min(seq.len());
         let mut cws: Vec<Vec<u8>> = seq[s..e].iter().map(|b| b.to_codeword(ecc)).collect();
         let real = cws.len();
         while cws.len() < p.blocks_per_page {
@@ -315,7 +352,11 @@ pub fn encode(cfg: &Config, files: &[FileEntry]) -> Result<Encoded, LayoutError>
         }
         let seed = (pi as u64).wrapping_mul(2_654_435_761) as u32;
         let desc = Descriptor {
-            format_version: FORMAT_VERSION,
+            format_version: if cfg.ink_planes == InkPlanes::K {
+                FORMAT_VERSION
+            } else {
+                FORMAT_VERSION_COLOUR
+            },
             symbology_id: SYMBOLOGY_RASTER_K,
             doc_uuid: uuid,
             plain_sha256_pre: plain_hash[..8].try_into().unwrap(),
@@ -344,14 +385,34 @@ pub fn encode(cfg: &Config, files: &[FileEntry]) -> Result<Encoded, LayoutError>
             fec_parity_blocks: p.group_parity as u32,
             total_data_blocks: p.data_blocks as u32,
             total_blocks: p.total_blocks as u32,
-            payload_len: payload.len() as u64,
+            payload_len: payload.len() as u32,
             render_dpi: cfg.render_dpi as u16,
             provenance: PROVENANCE_BLIND,
             flags: 0,
             band_rows: p.geo.band_rows as u16,
+            ink_planes: cfg.ink_planes.code(),
+            cal_period: if cfg.ink_planes == InkPlanes::K {
+                0
+            } else {
+                CAL_PERIOD as u8
+            },
+            cal_patch_cells: if cfg.ink_planes == InkPlanes::K {
+                0
+            } else {
+                CAL_BLOCK as u8
+            },
+            plane_reg_spec: if cfg.ink_planes == InkPlanes::K { 0 } else { 1 },
+        };
+        let cells = if cfg.ink_planes == InkPlanes::K {
+            raster::build_cells(&p.geo, &cws, pi as u16, seed)
+                .into_iter()
+                .map(|b| b as u8)
+                .collect()
+        } else {
+            crate::colour::build_cells(&p.geo, &cws, pi as u16, seed)
         };
         pages.push(EncodedPage {
-            cells: raster::build_cells(&p.geo, &cws, pi as u16, seed),
+            cells,
             strip: raster::build_descriptor_strip(&desc),
             descriptor: desc,
         });
