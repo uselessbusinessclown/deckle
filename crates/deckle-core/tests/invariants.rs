@@ -323,7 +323,12 @@ fn pdf_cross_reference_table_is_correct() {
     let geo = &enc.plan.geo;
     let imgs: Vec<_> = enc.pages.iter().map(|p| p.render(geo).luma).collect();
     assert!(imgs.len() >= 2, "want a multi-page PDF");
-    deckle_core::pdf::write_pdf(&path, &imgs, geo.page_w_mm, geo.page_h_mm).unwrap();
+    let pages: Vec<deckle_core::pdf::Page> = imgs
+        .iter()
+        .cloned()
+        .map(deckle_core::pdf::Page::Mono)
+        .collect();
+    deckle_core::pdf::write_pages(&path, &pages, geo.page_w_mm, geo.page_h_mm).unwrap();
     let bytes = std::fs::read(&path).unwrap();
 
     assert!(bytes.starts_with(b"%PDF-1.4"));

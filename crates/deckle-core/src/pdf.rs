@@ -124,61 +124,64 @@ pub fn write_pdf(
     std::fs::write(path, out)
 }
 
-/// Write data pages (which may be colour) followed by black-only bootstrap
-/// sheets.
-///
-/// Colour pages go out as three 1-bit image masks painted in DeviceCMYK cyan,
-/// magenta and yellow: true separations rather than an RGB image the driver
-/// would be free to reinterpret. Whether a commodity driver honours that,
-/// instead of applying grey component replacement and rewriting C+M+Y as K, is
-/// PLAN.md's open question OQ-10 and needs a real printer to answer.
-pub fn write_pages(
-    path: &std::path::Path,
-    pages: &[crate::bitmap::Scan],
-    bootstrap: &[Gray],
-    page_w_mm: f64,
-    page_h_mm: f64,
-) -> std::io::Result<()> {
-    let mut all: Vec<Page> = Vec::new();
-    for s in pages {
-        all.push(match &s.rgb {
-            None => Page::Mono(s.luma.clone()),
-            Some(c) => {
-                // Each ink is dark in exactly one channel under the print model.
-                let sep = std::array::from_fn(|ch| {
-                    let mut g = Gray::new(c.w, c.h, 255);
-                    for y in 0..c.h {
-                        for x in 0..c.w {
-                            // Structural black prints in all three separations.
-                            g.set(x, y, c.get(x, y)[ch]);
-                        }
-                    }
-                    g
-                });
-                Page::Separations(sep)
-            }
-        });
-    }
-    all.extend(bootstrap.iter().cloned().map(Page::Mono));
-    write_mixed(path, &all, page_w_mm, page_h_mm)
+/// One page of output.
+pub enum Page {
+    /// A black-only page: a 1-bit image mask.
+    Mono(Gray),
+    /// A colour page: one palette index per device pixel, over an explicit
+    /// CMYK palette.
+    ///
+    /// Not three overlapping image masks in cyan, magenta and yellow. That looks
+    /// like separations but is wrong: PDF paints opaquely, so where two inks
+    /// coincide the second erases the first and a blue cell comes out magenta.
+    /// Getting it right with masks would need overprint control that many
+    /// renderers ignore. An indexed image states the ink combination for every
+    /// pixel outright, with nothing left to interpret.
+    IndexedCmyk { w: usize, h: usize, idx: Vec<u8> },
 }
 
-pub enum Page {
-    Mono(Gray),
-    /// Cyan, magenta and yellow separations, each dark where that ink prints.
-    Separations([Gray; 3]),
-}
+/// Palette: index i carries cyan in bit 0, magenta in bit 1, yellow in bit 2.
+/// Index 8 is structural black, the only place K ink is used.
+const CMYK_PALETTE: [[u8; 4]; 9] = [
+    [0, 0, 0, 0],
+    [255, 0, 0, 0],
+    [0, 255, 0, 0],
+    [255, 255, 0, 0],
+    [0, 0, 255, 0],
+    [255, 0, 255, 0],
+    [0, 255, 255, 0],
+    [255, 255, 255, 0],
+    [0, 0, 0, 255],
+];
 
 impl Page {
-    fn images(&self) -> usize {
-        match self {
-            Page::Mono(_) => 1,
-            Page::Separations(_) => 3,
+    /// Build a colour page from a rendered image and the mask saying where black
+    /// ink went. Under the print model an ink is absent where its channel is
+    /// bright, so the index falls straight out of the three channels.
+    pub fn indexed_cmyk(rgb: &crate::bitmap::Rgb, black: &Gray) -> Page {
+        let mut idx = vec![0u8; rgb.w * rgb.h];
+        for i in 0..rgb.w * rgb.h {
+            idx[i] = if black.px[i] == 0 {
+                8
+            } else {
+                let p = [rgb.px[i * 3], rgb.px[i * 3 + 1], rgb.px[i * 3 + 2]];
+                (p[0] < 128) as u8 | ((p[1] < 128) as u8) << 1 | ((p[2] < 128) as u8) << 2
+            };
+        }
+        Page::IndexedCmyk {
+            w: rgb.w,
+            h: rgb.h,
+            idx,
         }
     }
 }
 
-fn write_mixed(
+/// Write pages at exact physical size.
+///
+/// Whether a commodity driver keeps the separations apart, rather than applying
+/// grey component replacement and rewriting C+M+Y as K, is PLAN.md's open
+/// question OQ-10 and needs a real printer to answer.
+pub fn write_pages(
     path: &std::path::Path,
     pages: &[Page],
     page_w_mm: f64,
@@ -186,17 +189,10 @@ fn write_mixed(
 ) -> std::io::Result<()> {
     let w_pt = page_w_mm * 72.0 / 25.4;
     let h_pt = page_h_mm * 72.0 / 25.4;
-    // Object ids: 1 catalog, 2 page tree, then per page its images, its content
-    // stream and its page object, all in order.
-    let mut page_obj_id = Vec::with_capacity(pages.len());
-    let mut next = 3usize;
-    for p in pages {
-        next += p.images();
-        next += 1; // content
-        page_obj_id.push(next);
-        next += 1;
-    }
-    let total_objs = next - 1;
+    // Object ids: 1 catalog, 2 page tree, then per page an image, a content
+    // stream and the page object, in that order.
+    let total_objs = 2 + 3 * pages.len();
+    let page_obj_id: Vec<usize> = (0..pages.len()).map(|i| 5 + 3 * i).collect();
 
     let mut out: Vec<u8> = Vec::new();
     let mut offsets: Vec<usize> = Vec::with_capacity(total_objs);
@@ -222,40 +218,41 @@ fn write_mixed(
 
     let mut id = 3usize;
     for (pi, page) in pages.iter().enumerate() {
-        let masks: Vec<&Gray> = match page {
-            Page::Mono(g) => vec![g],
-            Page::Separations(s) => s.iter().collect(),
-        };
-        let mut img_ids = Vec::new();
-        for g in &masks {
-            let data = flate(&pack_mask(g));
-            begin(&mut out, &mut offsets, id);
-            out.extend_from_slice(
+        let (dict, data) = match page {
+            Page::Mono(g) => (
                 format!(
                     "<</Type/XObject/Subtype/Image/Width {}/Height {}/ImageMask true\
-                     /Decode[1 0]/BitsPerComponent 1/Filter/FlateDecode/Length {}>>\nstream\n",
-                    g.w,
-                    g.h,
-                    data.len()
+                     /Decode[1 0]/BitsPerComponent 1/Filter/FlateDecode",
+                    g.w, g.h
+                ),
+                flate(&pack_mask(g)),
+            ),
+            Page::IndexedCmyk { w, h, idx } => {
+                let pal: String = CMYK_PALETTE
+                    .iter()
+                    .flat_map(|e| e.iter())
+                    .map(|b| format!("{b:02X}"))
+                    .collect();
+                (
+                    format!(
+                        "<</Type/XObject/Subtype/Image/Width {w}/Height {h}\
+                         /ColorSpace[/Indexed/DeviceCMYK {} <{pal}>]/BitsPerComponent 4\
+                         /Filter/FlateDecode",
+                        CMYK_PALETTE.len() - 1
+                    ),
+                    flate(&pack_nibbles(*w, *h, idx)),
                 )
-                .as_bytes(),
-            );
-            out.extend_from_slice(&data);
-            out.extend_from_slice(b"\nendstream\nendobj\n");
-            img_ids.push(id);
-            id += 1;
-        }
-        let mut content = String::new();
-        for (k, iid) in img_ids.iter().enumerate() {
-            let ink = match (page, k) {
-                (Page::Mono(_), _) => "0 0 0 1 k",
-                (Page::Separations(_), 0) => "1 0 0 0 k",
-                (Page::Separations(_), 1) => "0 1 0 0 k",
-                _ => "0 0 1 0 k",
-            };
-            let _ = iid;
-            content += &format!("q {ink} {w_pt:.4} 0 0 {h_pt:.4} 0 0 cm /Im{k} Do Q\n");
-        }
+            }
+        };
+        begin(&mut out, &mut offsets, id);
+        out.extend_from_slice(format!("{dict}/Length {}>>\nstream\n", data.len()).as_bytes());
+        out.extend_from_slice(&data);
+        out.extend_from_slice(b"\nendstream\nendobj\n");
+        let img_id = id;
+        id += 1;
+
+        // Map the unit image square onto the whole page, at exact physical size.
+        let content = format!("q {w_pt:.4} 0 0 {h_pt:.4} 0 0 cm /Im0 Do Q");
         begin(&mut out, &mut offsets, id);
         out.extend_from_slice(
             format!(
@@ -266,23 +263,19 @@ fn write_mixed(
         );
         let c_id = id;
         id += 1;
-        let xobjects: Vec<String> = img_ids
-            .iter()
-            .enumerate()
-            .map(|(k, i)| format!("/Im{k} {i} 0 R"))
-            .collect();
+
         begin(&mut out, &mut offsets, id);
         debug_assert_eq!(id, page_obj_id[pi]);
         out.extend_from_slice(
             format!(
                 "<</Type/Page/Parent 2 0 R/MediaBox[0 0 {w_pt:.4} {h_pt:.4}]\
-                 /Resources<</XObject<<{}>>>>/Contents {c_id} 0 R>>\nendobj\n",
-                xobjects.join("")
+                 /Resources<</XObject<</Im0 {img_id} 0 R>>>>/Contents {c_id} 0 R>>\nendobj\n"
             )
             .as_bytes(),
         );
         id += 1;
     }
+    debug_assert_eq!(offsets.len(), total_objs);
 
     let xref_at = out.len();
     out.extend_from_slice(format!("xref\n0 {}\n", total_objs + 1).as_bytes());
@@ -298,4 +291,22 @@ fn write_mixed(
         .as_bytes(),
     );
     std::fs::write(path, out)
+}
+
+/// Two 4-bit samples per byte, rows padded to a byte boundary.
+fn pack_nibbles(w: usize, h: usize, idx: &[u8]) -> Vec<u8> {
+    let stride = w.div_ceil(2);
+    let mut out = vec![0u8; stride * h];
+    for y in 0..h {
+        for x in 0..w {
+            let v = idx[y * w + x] & 0x0F;
+            let o = y * stride + x / 2;
+            if x % 2 == 0 {
+                out[o] |= v << 4;
+            } else {
+                out[o] |= v;
+            }
+        }
+    }
+    out
 }

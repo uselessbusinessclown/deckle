@@ -264,29 +264,32 @@ impl WhiteMap {
     }
 }
 
-#[inline]
-fn density(sample: f64, white: f64) -> f64 {
-    -((sample.max(1.0) / white).min(1.0)).ln()
-}
-
-/// The fitted colour model for one page.
+/// The fitted colour model for one page: where each ink combination actually
+/// lands in scanner colour, measured from the page's own calibration patches.
 pub struct Calibration {
-    /// Inverse of the 3x3 ink density matrix: density vector -> (c, m, y).
-    inv: [[f64; 3]; 3],
+    /// One reflectance triple per ink state, indexed by its ink bits.
+    centroids: Vec<[f64; 3]>,
     pub white: WhiteMap,
     pub patches: usize,
-    /// Planes with no measurable ink left. Their bits are unreadable, so they
-    /// are reported with zero confidence and rebuilt from cross-block parity -
-    /// which is the whole reason a plane owns its codewords outright.
+    /// Planes whose two states are no longer distinguishable - an ink that has
+    /// faded away. Reported with zero confidence so its blocks reach parity.
     pub dead: [bool; 3],
     pub planes: usize,
 }
 
-/// Fit the ink model from the calibration lattice by least squares.
+/// Fit the colour model from the calibration lattice.
 ///
-/// Each patch prints a known combination of inks, so the page carries its own
-/// answer to "what does cyan look like here, today, on this paper, through this
-/// scanner". The patches fade with the data, which is the whole point.
+/// Nearest-centroid over the measured states, not a linear unmixing of optical
+/// densities. Density additivity assumes ideal inks, and real ones are not:
+/// rendered through a colour-managed CMYK path, cyan's red channel clips to zero
+/// while magenta only takes green down to 16, so cyan+magenta measures nothing
+/// like the sum of the two. Measuring where each combination actually lands
+/// makes no assumption about ink behaviour at all - and it degrades gracefully
+/// under blur, because contrast loss contracts every state toward the local mean
+/// without changing which centroid is nearest.
+///
+/// The patches age with the data, so the model tracks the ink rather than a
+/// factory assumption.
 pub fn calibrate(
     img: &Rgb,
     planes: usize,
@@ -295,167 +298,113 @@ pub fn calibrate(
     white: WhiteMap,
     cell_px: f64,
 ) -> Option<Calibration> {
-    // Normal equations for D minimising |d - D s|^2 over patches.
-    let mut sts = [[0.0f64; 3]; 3];
-    let mut dst = [[0.0f64; 3]; 3];
-    let mut n = 0usize;
+    let n_states = 1usize << planes;
+    let mut sum = vec![[0.0f64; 3]; n_states];
+    let mut count = vec![0usize; n_states];
     for &(px, py, state) in patches {
-        let s = [
-            (state & 1) as f64,
-            (state >> 1 & 1) as f64,
-            (state >> 2 & 1) as f64,
-        ];
-        let mut d = [0.0f64; 3];
+        let st = (state as usize) & (n_states - 1);
+        // The patch is four cells across, so average well inside it. Each
+        // channel is read at its own plane's position, since the inks do not
+        // land exactly on top of each other.
+        let o = cell_px * 0.8;
         for c in 0..3 {
-            let p = plane_pos(c, px as f64 + 2.0, py as f64 + 2.0);
-            // The patch is four cells across, so average well inside it.
-            let o = cell_px * 0.8;
+            let p = plane_pos(c.min(planes - 1), px as f64 + 2.0, py as f64 + 2.0);
             let v = (img.sample(c, p.x, p.y)
                 + img.sample(c, p.x - o, p.y - o)
                 + img.sample(c, p.x + o, p.y - o)
                 + img.sample(c, p.x - o, p.y + o)
                 + img.sample(c, p.x + o, p.y + o))
                 / 5.0;
-            d[c] = density(v, white.at(p.x, p.y, c));
+            sum[st][c] += v / white.at(p.x, p.y, c);
         }
-        for i in 0..3 {
-            for j in 0..3 {
-                sts[i][j] += s[i] * s[j];
-                dst[i][j] += d[i] * s[j];
-            }
-        }
-        n += 1;
+        count[st] += 1;
     }
-    // Enough patches to determine the model: one per ink state, at least.
-    if n < (1usize << planes).max(4) {
+    // Every ink combination has to have been seen, or the model has a hole in it.
+    if count.contains(&0) {
         return None;
     }
-    // With fewer than three inks the unused dimensions have no data, which
-    // leaves the normal equations singular. Pad them to the identity: those
-    // columns then solve to zero and are replaced with a nominal column below.
-    for j in planes..3 {
-        sts[j][j] = 1.0;
-    }
-    let sts_inv = invert3(&sts)?;
-    // D = dst * sts^-1
-    let mut dmat = [[0.0f64; 3]; 3];
-    for i in 0..3 {
-        for j in 0..3 {
-            dmat[i][j] = (0..3).map(|k| dst[i][k] * sts_inv[k][j]).sum();
-        }
-    }
-    // A plane that has faded to nothing leaves a near-zero column, which would
-    // make the matrix singular and take the surviving planes down with it. Give
-    // it a nominal column instead and mark it dead, so its share of the blocks
-    // goes to parity while the rest decode normally.
-    //
-    // The bar is deliberately low. It exists to keep the matrix out of the
-    // singular region, not to judge readability: a weak plane is better tried and
-    // failed, because its codewords then become erasures and reach parity by a
-    // route that recovers the ink if it turns out to be legible. At a quarter of
-    // the strongest plane this was condemning a 30% faded ink that reads
-    // perfectly well, and spending a third of the archive's parity to do it.
-    //
-    // Planes this archive never used get the same nominal column, but are not
-    // "dead" - they were never alive.
-    let norms: [f64; 3] =
-        std::array::from_fn(|j| (0..3).map(|i| dmat[i][j] * dmat[i][j]).sum::<f64>().sqrt());
-    let strongest = norms[..planes].iter().cloned().fold(0.0f64, f64::max);
+    let centroids: Vec<[f64; 3]> = (0..n_states)
+        .map(|s| std::array::from_fn(|c| sum[s][c] / count[s] as f64))
+        .collect();
+
+    // A plane is dead when flipping its bit no longer moves the colour: the ink
+    // has faded past the point of being visible. The bar is low on purpose -
+    // this is about the model having no signal to work with, not about judging
+    // readability, since a weak plane that fails decoding reaches parity anyway.
     let mut dead = [false; 3];
-    for j in 0..3 {
-        let unused = j >= planes;
-        if unused || strongest <= 1e-6 || norms[j] < strongest * 0.03 {
-            dead[j] = !unused;
-            for i in 0..3 {
-                dmat[i][j] = if i == j { strongest.max(1.0) } else { 0.0 };
+    for p in 0..planes {
+        let mut worst = f64::MAX;
+        for s in 0..n_states {
+            if s >> p & 1 == 0 {
+                let d = dist2(&centroids[s], &centroids[s | 1 << p]).sqrt();
+                worst = worst.min(d);
             }
         }
+        dead[p] = worst < 0.02;
     }
     Some(Calibration {
-        inv: invert3(&dmat)?,
+        centroids,
         white,
-        patches: n,
+        patches: patches.len(),
         dead,
         planes,
     })
 }
 
+#[inline]
+fn dist2(a: &[f64; 3], b: &[f64; 3]) -> f64 {
+    (0..3).map(|i| (a[i] - b[i]) * (a[i] - b[i])).sum()
+}
+
 impl Calibration {
-    /// Estimated ink coverage from a density vector.
+    /// Reflectance of one cell, each channel read at its own plane's position.
     #[inline]
-    pub fn solve(&self, d: [f64; 3]) -> [f64; 3] {
-        std::array::from_fn(|i| (0..3).map(|j| self.inv[i][j] * d[j]).sum())
+    pub fn reflectance(&self, img: &Rgb, at: &[Point; 3], cell_px: f64) -> [f64; 3] {
+        let o = cell_px * 0.13;
+        std::array::from_fn(|c| {
+            let p = at[c];
+            let v = (img.sample(c, p.x, p.y)
+                + img.sample(c, p.x - o, p.y - o)
+                + img.sample(c, p.x + o, p.y - o)
+                + img.sample(c, p.x - o, p.y + o)
+                + img.sample(c, p.x + o, p.y + o))
+                / 5.0;
+            v / self.white.at(p.x, p.y, c)
+        })
     }
 
-    /// Decide each plane against a locally adaptive threshold.
+    /// Decide each plane by which measured state the cell is closest to.
     ///
-    /// `d` is the cell's density vector, `d_mean` the neighbourhood's. Whitened
-    /// payload puts each ink on about half the cells, so the local mean sits
-    /// between the two states and tracks anything that shrinks the swing.
+    /// Confidence is how much better the winning half is than the other, which
+    /// is exactly what the erasure ladder wants: a cell that sits between two
+    /// states is flagged rather than guessed.
     #[inline]
-    pub fn decide(&self, d: [f64; 3], d_mean: [f64; 3]) -> ([bool; 3], [f64; 3]) {
-        let est = self.solve(d);
-        let thr = self.solve(d_mean);
+    pub fn decide(&self, r: [f64; 3]) -> ([bool; 3], [f64; 3]) {
+        let mut best = [f64::MAX; 3];
+        let mut best_set = [f64::MAX; 3];
+        for (s, c) in self.centroids.iter().enumerate() {
+            let d = dist2(c, &r);
+            for p in 0..self.planes {
+                if s >> p & 1 == 0 {
+                    best[p] = best[p].min(d);
+                } else {
+                    best_set[p] = best_set[p].min(d);
+                }
+            }
+        }
         let mut bits = [false; 3];
         let mut conf = [0.0f64; 3];
-        for i in 0..3 {
-            let t = thr[i].clamp(0.25, 0.75);
-            bits[i] = est[i] > t;
-            conf[i] = if self.dead[i] {
+        for p in 0..self.planes {
+            let (d0, d1) = (best[p].sqrt(), best_set[p].sqrt());
+            bits[p] = d1 < d0;
+            conf[p] = if self.dead[p] {
                 0.0
             } else {
-                ((est[i] - t).abs() * 2.5).min(1.0)
+                ((d0 - d1).abs() / (d0 + d1 + 1e-6)).min(1.0)
             };
         }
         (bits, conf)
     }
-    /// Ink density at a cell centre, averaged over the middle of the cell.
-    ///
-    /// A single sample is far too sensitive to sub-pixel placement: it left a
-    /// clean colour page consuming its whole correction budget. The mono path
-    /// has always averaged an aperture; colour needs it more, not less, because
-    /// three bits ride on each cell.
-    /// Density of the local mean, for the adaptive threshold.
-    #[inline]
-    pub fn mean_density_at(&self, ch: usize, p: Point) -> f64 {
-        density(
-            self.white.mean_at(p.x, p.y, ch),
-            self.white.at(p.x, p.y, ch),
-        )
-    }
-
-    #[inline]
-    pub fn density_at(&self, img: &Rgb, ch: usize, p: Point, cell_px: f64) -> f64 {
-        let o = cell_px * 0.13;
-        let v = (img.sample(ch, p.x, p.y)
-            + img.sample(ch, p.x - o, p.y - o)
-            + img.sample(ch, p.x + o, p.y - o)
-            + img.sample(ch, p.x - o, p.y + o)
-            + img.sample(ch, p.x + o, p.y + o))
-            / 5.0;
-        density(v, self.white.at(p.x, p.y, ch))
-    }
-}
-
-fn invert3(m: &[[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
-    let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
-        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
-        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0]);
-    if det.abs() < 1e-9 {
-        return None;
-    }
-    let c = |a: usize, b: usize, x: usize, y: usize| m[a][b] * m[x][y];
-    let mut o = [[0.0f64; 3]; 3];
-    o[0][0] = (c(1, 1, 2, 2) - c(1, 2, 2, 1)) / det;
-    o[0][1] = (c(0, 2, 2, 1) - c(0, 1, 2, 2)) / det;
-    o[0][2] = (c(0, 1, 1, 2) - c(0, 2, 1, 1)) / det;
-    o[1][0] = (c(1, 2, 2, 0) - c(1, 0, 2, 2)) / det;
-    o[1][1] = (c(0, 0, 2, 2) - c(0, 2, 2, 0)) / det;
-    o[1][2] = (c(0, 2, 1, 0) - c(0, 0, 1, 2)) / det;
-    o[2][0] = (c(1, 0, 2, 1) - c(1, 1, 2, 0)) / det;
-    o[2][1] = (c(0, 1, 2, 0) - c(0, 0, 2, 1)) / det;
-    o[2][2] = (c(0, 0, 1, 1) - c(0, 1, 1, 0)) / det;
-    Some(o)
 }
 
 /// Per-plane registration, as a correction on top of the warped black geometry.

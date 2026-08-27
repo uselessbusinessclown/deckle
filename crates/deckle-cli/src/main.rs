@@ -288,8 +288,14 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
     let geo = &enc.plan.geo;
 
     let mut rendered = Vec::with_capacity(enc.pages.len());
+    let mut for_pdf: Vec<pdf::Page> = Vec::with_capacity(enc.pages.len());
     for p in &enc.pages {
-        rendered.push(p.render(geo));
+        let (scan, black) = p.render_masked(geo);
+        for_pdf.push(match (&scan.rgb, &black) {
+            (Some(rgb), Some(k)) => pdf::Page::indexed_cmyk(rgb, k),
+            _ => pdf::Page::Mono(scan.luma.clone()),
+        });
+        rendered.push(scan);
     }
     let boot = if o.bootstrap {
         bootstrap::render_sheets(
@@ -321,8 +327,10 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
     if o.format != "png" {
         // The bootstrap sheets go last, so they end up on top when the stack is
         // turned face up.
+        let mut all = for_pdf;
+        all.extend(boot.iter().cloned().map(pdf::Page::Mono));
         let path = out.join("archive.pdf");
-        pdf::write_pages(&path, &rendered, &boot, geo.page_w_mm, geo.page_h_mm)
+        pdf::write_pages(&path, &all, geo.page_w_mm, geo.page_h_mm)
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
 

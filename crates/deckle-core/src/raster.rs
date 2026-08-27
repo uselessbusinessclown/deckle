@@ -18,7 +18,7 @@
 
 use crate::bitmap::{Gray, Integral, Scan};
 use crate::block::{decode_codeword, Block, BlockDecode, BlockError, FILLER_INDEX, FLAG_FILLER};
-use crate::colour::{self, PLANE_CHANNEL};
+use crate::colour::{self};
 use crate::descriptor::Descriptor;
 use crate::geom::{Homography, Point};
 use crate::gf256::{rs_decode, rs_encode_parity};
@@ -501,15 +501,13 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
                     Some((rgb, pw, cal)) => {
                         let p0 = h_uv2img.apply(base);
                         let (bx, by) = (p0.x + d.0, p0.y + d.1);
-                        let mut dens = [0.0f64; 3];
-                        let mut dmean = [0.0f64; 3];
-                        for p in 0..planes {
+                        // Each channel is read at its own plane's position.
+                        let at: [Point; 3] = std::array::from_fn(|c| {
+                            let p = c.min(planes - 1);
                             let (dx, dy) = pw.at(p, x as f64 + 0.5, y as f64 + 0.5);
-                            let at = Point::new(bx + dx, by + dy);
-                            dens[p] = cal.density_at(rgb, PLANE_CHANNEL[p], at, cell_px);
-                            dmean[p] = cal.mean_density_at(PLANE_CHANNEL[p], at);
-                        }
-                        let (b, c) = cal.decide(dens, dmean);
+                            Point::new(bx + dx, by + dy)
+                        });
+                        let (b, c) = cal.decide(cal.reflectance(rgb, &at, cell_px));
                         bits = b;
                         for p in 0..planes {
                             strengths[p] = c[p] as f32;
