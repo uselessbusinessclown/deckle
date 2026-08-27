@@ -110,7 +110,14 @@ pub enum InkPlanes {
     /// Black only. The default, and the only mode rated for long-term storage.
     #[default]
     K,
-    /// Cyan, magenta and yellow. Roughly doubles capacity; not archival.
+    /// Cyan and magenta. Two bits per cell.
+    ///
+    /// Yellow is the weak link twice over: it is the least lightfast ink in
+    /// almost every set, and it is read in the blue channel, which is the
+    /// noisiest a scanner has. Leaving it out costs a third of the colour gain
+    /// and removes the plane most likely to fade first.
+    Cm,
+    /// Cyan, magenta and yellow. Three bits per cell; the most capacity.
     Cmy,
 }
 
@@ -119,6 +126,7 @@ impl InkPlanes {
     pub fn bits_per_cell(self) -> usize {
         match self {
             InkPlanes::K => 1,
+            InkPlanes::Cm => 2,
             InkPlanes::Cmy => 3,
         }
     }
@@ -129,12 +137,14 @@ impl InkPlanes {
         match self {
             InkPlanes::K => 0,
             // bit0 = cyan, bit1 = magenta, bit2 = yellow (PLAN.md 18.9)
+            InkPlanes::Cm => 0b011,
             InkPlanes::Cmy => 0b111,
         }
     }
     pub fn from_code(c: u8) -> Option<InkPlanes> {
         match c {
             0 => Some(InkPlanes::K),
+            0b011 => Some(InkPlanes::Cm),
             0b111 => Some(InkPlanes::Cmy),
             _ => None,
         }
@@ -142,8 +152,23 @@ impl InkPlanes {
     pub fn parse(s: &str) -> Option<InkPlanes> {
         match s.to_ascii_lowercase().as_str() {
             "k" | "black" | "mono" => Some(InkPlanes::K),
+            "cm" | "cyanmagenta" => Some(InkPlanes::Cm),
             "cmy" | "cmyk" | "color" | "colour" => Some(InkPlanes::Cmy),
             _ => None,
+        }
+    }
+    pub fn label(self) -> &'static str {
+        match self {
+            InkPlanes::K => "black only (K) - archival",
+            InkPlanes::Cm => "cyan + magenta - 2 bits per cell, no yellow to fade first",
+            InkPlanes::Cmy => "cyan, magenta, yellow - 3 bits per cell, NOT archival",
+        }
+    }
+    pub fn plane_names(self) -> &'static [&'static str] {
+        match self {
+            InkPlanes::K => &["black"],
+            InkPlanes::Cm => &["cyan", "magenta"],
+            InkPlanes::Cmy => &["cyan", "magenta", "yellow"],
         }
     }
 }
@@ -518,7 +543,8 @@ pub fn cal_patches_for(
                 && !in_corner(x, y, cols, rows, f)
                 && !in_corner(x + CAL_BLOCK - 1, y + CAL_BLOCK - 1, cols, rows, f)
             {
-                out.push((x, y, ((gx + gy * 3) % 8) as u8));
+                let states = 1usize << ink.count();
+                out.push((x, y, ((gx + gy * 3) % states) as u8));
             }
             gx += 1;
         }

@@ -34,11 +34,14 @@ OPTIONS
                    number of dots at this resolution         (default 600)
   --ecc L|M|Q|H    symbol error correction                   (default Q)
   --parity F       cross-block parity ratio, 0 to disable    (default 0.20)
-  --ink k|cmy      ink planes carrying payload               (default k)
-                   k   black only; the only mode rated for long-term
+  --ink k|cm|cmy   ink planes carrying payload               (default k)
+                   k   black only. The only mode rated for long-term
                        storage, and what you want on laser toner
-                   cmy adds colour for roughly double the capacity.
-                       Designed in docs/PLAN.md 18, not yet built
+                   cm  cyan + magenta, 2 bits per cell, about 2x.
+                       Leaves out yellow, which fades first and is
+                       read in the noisiest scanner channel
+                   cmy all three, 3 bits per cell, about 3x. The most
+                       capacity and the least durable
   --format png|pdf|both                                      (default both)
   --no-bootstrap   omit the decoding documentation            (default: on)
                    The bootstrap page carries the format, the procedure
@@ -263,14 +266,7 @@ fn print_estimate(e: &Estimate, json: bool) {
             p.pages
         );
     }
-    println!(
-        "Ink                {}",
-        match e.plan.geo.ink {
-            deckle_core::layout::InkPlanes::K => "black only (K) - archival",
-            deckle_core::layout::InkPlanes::Cmy =>
-                "cyan, magenta, yellow - 3 bits per cell, NOT archival",
-        }
-    );
+    println!("Ink                {}", e.plan.geo.ink.label());
     println!("Density provenance UNVERIFIED (chosen blind)");
     for w in &e.warnings {
         println!("Warning            {w}");
@@ -545,8 +541,12 @@ fn cmd_inspect(o: &Opts) -> Result<(), String> {
         if let Some(reg) = d.plane_registration {
             let m = d.plane_margin.unwrap_or([0.0; 3]);
             let dead = d.dead_planes.unwrap_or([false; 3]);
-            println!("Ink planes         cyan, magenta, yellow");
-            for (i, name) in ["cyan", "magenta", "yellow"].iter().enumerate() {
+            let names = de
+                .ink()
+                .map(|i| i.plane_names())
+                .unwrap_or(&["cyan", "magenta", "yellow"]);
+            println!("Ink planes         {}", names.join(", "));
+            for (i, name) in names.iter().enumerate() {
                 println!(
                     "  {name:<16} registration {:.2} cells, margin {:.0}% of capacity{}",
                     reg[i],

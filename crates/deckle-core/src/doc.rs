@@ -130,13 +130,23 @@ pub fn plan(cfg: &Config, payload_len: usize) -> Result<DocPlan, LayoutError> {
     let data_blocks = payload_len.div_ceil(per_block).max(1);
 
     let ratio = cfg.parity_ratio.clamp(0.0, 2.0);
+    let planes = cfg.ink_planes.count();
     let (group_data, group_parity, groups, parity_blocks) = if ratio <= 0.0 {
         (data_blocks.max(1), 0, 1, 0)
     } else {
         // GF(256) caps a group at 255 blocks including parity, so split and stripe.
         let max_data = ((fec::MAX_GROUP as f64) / (1.0 + ratio)).floor() as usize;
         let max_data = max_data.clamp(1, fec::MAX_GROUP - 1);
-        let groups = data_blocks.div_ceil(max_data);
+        let mut groups = data_blocks.div_ceil(max_data);
+        // Blocks stripe across the parity groups with period `groups`, and across
+        // the ink planes with period `planes`. If those share a factor the two
+        // interleavers alias: at nine groups and three planes, every group landed
+        // wholly in one ink, so losing that ink destroyed three groups outright
+        // rather than costing every group a recoverable third. Keeping the
+        // periods coprime costs at most one extra group.
+        while gcd(groups, planes) != 1 {
+            groups += 1;
+        }
         let gd = data_blocks.div_ceil(groups);
         let gp = ((gd as f64 * ratio).ceil() as usize).max(1);
         (gd, gp, groups, gp * groups)
@@ -159,6 +169,40 @@ pub fn plan(cfg: &Config, payload_len: usize) -> Result<DocPlan, LayoutError> {
         pages,
         blocks_per_sheet,
     })
+}
+
+fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// Codeword slots of a page, ordered so consecutive blocks spread across the
+/// ink planes and the interleave bands.
+fn codeword_order(geo: &PageGeometry) -> Vec<usize> {
+    let planes = geo.ink.count();
+    let max_per = geo
+        .bands
+        .iter()
+        .map(|b| b.codewords / planes)
+        .max()
+        .unwrap_or(0);
+    let mut order = Vec::with_capacity(geo.codewords);
+    for j in 0..max_per {
+        for band in &geo.bands {
+            let per = band.codewords / planes;
+            if j < per {
+                for p in 0..planes {
+                    order.push(band.first_cw + p * per + j);
+                }
+            }
+        }
+    }
+    debug_assert_eq!(order.len(), geo.codewords);
+    order
 }
 
 #[derive(Clone, Debug)]
@@ -339,16 +383,22 @@ pub fn encode(cfg: &Config, files: &[FileEntry]) -> Result<Encoded, LayoutError>
     }
     debug_assert_eq!(seq.len(), p.total_blocks);
 
+    // Order the page's codeword slots so that consecutive blocks land in
+    // different ink planes and different bands. Filling plane 0 first would put
+    // a small archive entirely in one ink, and losing that ink would then lose
+    // everything - exactly what giving each plane its own codewords is meant to
+    // prevent.
+    let order = codeword_order(&p.geo);
     let mut pages = Vec::with_capacity(p.pages);
     for pi in 0..p.pages {
         let s = (pi * p.blocks_per_sheet).min(seq.len());
         let e = ((pi + 1) * p.blocks_per_sheet).min(seq.len());
-        let mut cws: Vec<Vec<u8>> = seq[s..e].iter().map(|b| b.to_codeword(ecc)).collect();
-        let real = cws.len();
-        while cws.len() < p.blocks_per_page {
-            cws.push(
-                raster::filler_block(ecc, (pi as u64) << 32 | cws.len() as u64).to_codeword(ecc),
-            );
+        let real = e - s;
+        let mut cws: Vec<Vec<u8>> = (0..p.blocks_per_page)
+            .map(|i| raster::filler_block(ecc, (pi as u64) << 32 | i as u64).to_codeword(ecc))
+            .collect();
+        for (i, blk) in seq[s..e].iter().enumerate() {
+            cws[order[i]] = blk.to_codeword(ecc);
         }
         let seed = (pi as u64).wrapping_mul(2_654_435_761) as u32;
         let desc = Descriptor {

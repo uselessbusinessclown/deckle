@@ -87,6 +87,74 @@ fn colour_carries_three_bits_per_cell() {
 }
 
 #[test]
+fn cyan_magenta_gives_two_bits_and_no_yellow() {
+    // Yellow is the weak link twice over: least lightfast, and read in the
+    // noisiest scanner channel. --ink cm drops it for two thirds of the gain.
+    let mono = PageGeometry::plan(&cfg(InkPlanes::K, 0.2)).unwrap();
+    let cm = PageGeometry::plan(&cfg(InkPlanes::Cm, 0.2)).unwrap();
+    assert_eq!(InkPlanes::Cm.bits_per_cell(), 2);
+    assert_eq!(InkPlanes::parse("cm"), Some(InkPlanes::Cm));
+    let ratio = cm.payload_bytes_per_page() as f64 / mono.payload_bytes_per_page() as f64;
+    assert!(
+        (1.9..=2.0).contains(&ratio),
+        "cm should be just under 2x, got {ratio:.3}"
+    );
+    for b in &cm.bands {
+        assert_eq!(
+            b.codewords % 2,
+            0,
+            "each of the two planes owns whole codewords"
+        );
+    }
+
+    // No cell may carry yellow.
+    let enc = doc::encode(&cfg(InkPlanes::Cm, 0.2), &payload(6_000, 20)).unwrap();
+    let y = deckle_core::colour::INK_Y;
+    let k = deckle_core::colour::INK_K;
+    assert!(
+        enc.pages[0].cells.iter().all(|c| c & k != 0 || c & y == 0),
+        "a cyan/magenta page must lay down no yellow ink"
+    );
+    assert_eq!(enc.pages[0].descriptor.ink_planes, 0b011);
+    assert_eq!(
+        round_trip(
+            &cfg(InkPlanes::Cm, 0.2),
+            &payload(25_000, 21),
+            &Degradation::default()
+        ),
+        ""
+    );
+}
+
+#[test]
+fn cyan_magenta_ignores_everything_that_happens_to_yellow() {
+    // The point of leaving the plane out: nothing that goes wrong with yellow,
+    // or with the blue channel it is read in, can touch the archive.
+    let c = cfg(InkPlanes::Cm, 0.3);
+    let files = payload(15_000, 22);
+    for spec in ["fadey=1.0", "bluenoise=120", "cast=0.5", "crosstalk=0.5"] {
+        assert_eq!(
+            round_trip(&c, &files, &Degradation::parse(spec).unwrap()),
+            "",
+            "cyan/magenta should be untouched by {spec}"
+        );
+    }
+}
+
+#[test]
+fn a_lost_plane_is_rebuilt_in_cyan_magenta_too() {
+    let c = cfg(InkPlanes::Cm, 1.2);
+    let files = payload(15_000, 23);
+    for spec in ["fadec=1.0", "fadem=1.0"] {
+        assert_eq!(
+            round_trip(&c, &files, &Degradation::parse(spec).unwrap()),
+            "",
+            "losing a plane entirely should still recover: {spec}"
+        );
+    }
+}
+
+#[test]
 fn colour_round_trips_exactly() {
     assert_eq!(
         round_trip(

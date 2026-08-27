@@ -453,7 +453,7 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
             let d = lookup(cx - 0.5, cy - 0.5);
             Point::new(p.x + d.0, p.y + d.1)
         };
-        let pw = colour::plane_warp(rgb, &warped, cols, rows, f, unit, cell_px)
+        let pw = colour::plane_warp(rgb, &warped, cols, rows, f, unit, planes, cell_px)
             .ok_or(DecodeError::ColourFitFailed("registration marks not found"))?;
         let white = colour::WhiteMap::new(rgb, (cell_px * 8.0).max(16.0) as usize);
         let patches = cal_patches_for(cols, rows, f, unit, ink);
@@ -462,7 +462,7 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
             let d = pw.at(plane, cx, cy);
             Point::new(base.x + d.0, base.y + d.1)
         };
-        let cal = colour::calibrate(rgb, cols, &patches, &pos, white, cell_px)
+        let cal = colour::calibrate(rgb, planes, &patches, &pos, white, cell_px)
             .ok_or(DecodeError::ColourFitFailed("calibration patches unusable"))?;
         Some((rgb, pw, cal))
     } else {
@@ -503,7 +503,7 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
                         let (bx, by) = (p0.x + d.0, p0.y + d.1);
                         let mut dens = [0.0f64; 3];
                         let mut dmean = [0.0f64; 3];
-                        for p in 0..3 {
+                        for p in 0..planes {
                             let (dx, dy) = pw.at(p, x as f64 + 0.5, y as f64 + 0.5);
                             let at = Point::new(bx + dx, by + dy);
                             dens[p] = cal.density_at(rgb, PLANE_CHANNEL[p], at, cell_px);
@@ -511,7 +511,7 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
                         }
                         let (b, c) = cal.decide(dens, dmean);
                         bits = b;
-                        for p in 0..3 {
+                        for p in 0..planes {
                             strengths[p] = c[p] as f32;
                         }
                     }
@@ -555,7 +555,7 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
         for band in &bands {
             if cw >= band.first_cw && cw < band.first_cw + band.codewords {
                 let per = band.codewords / planes;
-                return ((cw - band.first_cw) / per.max(1)).min(2);
+                return ((cw - band.first_cw) / per.max(1)).min(planes - 1);
             }
         }
         0
@@ -598,7 +598,7 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
         blocks.iter().map(|b| b.margin).sum::<f64>() / blocks.len() as f64
     };
     Ok(PageDecode {
-        plane_margin: if planes == 3 { Some(plane_worst) } else { None },
+        plane_margin: if planes > 1 { Some(plane_worst) } else { None },
         plane_registration: colour_ctx
             .as_ref()
             .map(|(_, pw, _)| pw.mean_offset_cells(cell_px)),

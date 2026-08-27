@@ -56,7 +56,7 @@ Every subcommand takes `--json`.
 | Deflate compression with a skip-if-it-does-not-pay check | complete |
 | Bootstrap page: procedure, parameters, and both reference programs as QR | complete |
 | `dkl_ref.py` and `dkl_fec.py`, standard library only | complete |
-| Colour mode: three ink planes, per-plane codewords, calibration lattice | complete |
+| Colour mode: two or three ink planes, per-plane codewords, calibration lattice | complete |
 
 **Verified end to end through a real PDF engine**: a file encoded to PDF, rasterised by
 CoreGraphics at 600 dpi, and decoded back is byte-identical, with zero error-correction
@@ -263,3 +263,31 @@ now spread evenly across the sheets, and a test asserts the arithmetic the promi
 on: the fullest sheet's share must not exceed the parity fraction. This affected black
 archives too; colour only made it show up, because tripling the capacity per sheet makes
 the last-sheet remainder a much larger fraction of the whole.
+
+**4.13 Two interleavers with a shared factor is a silent catastrophe.** Blocks stripe
+across the parity groups with period `groups`, and across the ink planes with period
+`planes`. At nine groups and three planes those aliased perfectly: *every parity group
+landed wholly in one ink*, so losing that ink destroyed three groups outright instead of
+costing every group a recoverable third. The symptom looked like a decoder problem —
+"losing yellow is unrecoverable" — and was arithmetic. Keeping the two periods coprime
+costs at most one extra group, and `plan` now does that explicitly.
+
+The same class of thing bit the block-to-codeword mapping: filling plane 0's codewords
+first put a small archive entirely in one ink. Blocks now round-robin across planes and
+bands, which is what makes "an ink plane can fail" true for archives of any size rather
+than only large ones.
+
+**4.14 A "dead plane" test must be about conditioning, not readability.** Declaring an
+ink dead substitutes a nominal column so the unmixing matrix stays invertible, and sends
+that plane's blocks to parity. Set at a quarter of the strongest plane, it was condemning
+a 30% faded ink that reads perfectly well and spending a third of the archive's parity to
+do it. The bar belongs low - 3% - because a weak plane is better tried and failed: its
+codewords then become erasures and reach parity by a route that recovers the ink if it
+turns out to be legible.
+
+**4.15 Cyan-and-magenta is a better trade than full colour more often than not.**
+`--ink cm` gives exactly 2.00x against black, versus `cmy`'s 2.91-3.00x. What it buys for
+that third: complete immunity to blue-channel noise and to yellow fade, and 0.6 against
+0.4 tolerance of ink crosstalk, because there are two inks to separate rather than three.
+Yellow is the least lightfast ink in most sets and is read in the noisiest channel a
+scanner has, so it is the plane most likely to fail first in both storage and scanning.

@@ -65,6 +65,9 @@ and tells you whether it matched.
 Worst-case sheet counts, measured on incompressible input — real files with text or
 configuration in them compress first and need fewer sheets. A4, black only.
 
+All figures below are for black ink; `--ink cm` roughly halves the sheet count and
+`--ink cmy` roughly thirds it.
+
 | Content | 254 µm, 20% parity | 254 µm, 50% parity | 169 µm, 20% parity | 169 µm, 50% parity |
 |---|---|---|---|---|
 | 64 KiB | 2 sheets | 2 | 1 | 1 |
@@ -96,13 +99,22 @@ the total sheet count: half for a three-sheet archive, a fifth for a six-sheet o
 missing"* — and that line is the one to read. It covers fire, water, a torn page and an
 envelope going missing, not just exotic failures.
 
-**Ink.** Leave it at the default `--ink k`. Colour (`--ink cmy`) is built and it triples
-capacity — three ink planes, three bits per cell — but it is deliberately **not rated for
-long-term storage**, and for an archive that is the whole point. Colour inks and toners
-fade unevenly and yellow goes first; black toner is fused carbon and is the most stable
-printed material there is. Colour also needs a colour scan to read back, and the
-reference decoder printed on the bootstrap page refuses colour pages by design, so a
-colour archive depends on Deckle in a way a black one does not.
+**Ink.** Leave it at the default `--ink k` for anything you want to still read in twenty
+years. Black toner is fused carbon and is the most stable printed material there is.
+
+There are two colour modes, and the choice between them is about which ink you trust:
+
+- `--ink cmy` — three planes, **3x** capacity. The most you can get from a sheet.
+- `--ink cm` — cyan and magenta only, **2x** capacity. Leaves out yellow, which is the
+  least lightfast ink in almost every set *and* is read in the blue channel, the noisiest
+  a scanner has. Measured, it is completely untouched by blue-channel noise or yellow
+  fade, and tolerates half again as much ink crosstalk as `cmy`.
+
+If you are going to use colour at all, `cm` is usually the better trade: you give up a
+third of the gain and remove the plane most likely to fail first. Neither is rated for
+long-term storage. Both need a colour scan to read back, and the reference decoder
+printed on the bootstrap page refuses colour pages by design — so a colour archive
+depends on Deckle in a way a black one does not.
 
 Colour earns its place when capacity matters more than decades: a large working set you
 expect to re-print every few years, on pigment ink or colour toner, verified by an actual

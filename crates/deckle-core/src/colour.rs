@@ -50,10 +50,11 @@ pub fn build_cells(
     let (cols, rows, f, u) = (geo.cols, geo.rows, geo.fid_cells, geo.fid_unit);
     let mut cells = vec![0u8; cols * rows];
 
+    let planes = geo.ink.count();
     crate::raster::draw_structure(&mut cells, geo, INK_K);
     for (i, &(sx, sy)) in geo.reg_strips().iter().enumerate() {
         let _ = i;
-        for p in 0..3 {
+        for p in 0..planes {
             // A solid two-unit square inside a three-unit slot, so the mark keeps
             // a white border and its centroid is unambiguous.
             let ink = 1u8 << p;
@@ -80,16 +81,16 @@ pub fn build_cells(
     let mut filler = Rng::new(0xF111_E7C0 ^ page_index as u64);
     for (bi, band) in geo.bands.iter().enumerate() {
         let a = choose_interleave_a(band.cells) as u64;
-        let per_plane = band.codewords / 3;
+        let per_plane = band.codewords / planes;
         let used = per_plane * RS_N * 8;
         let mut i: usize = 0;
         for y in band.row0..band.row1 {
             for x in 0..cols {
-                if is_reserved_ink(cols, rows, f, u, InkPlanes::Cmy, x, y) {
+                if is_reserved_ink(cols, rows, f, u, geo.ink, x, y) {
                     continue;
                 }
                 let mut v = 0u8;
-                for p in 0..3 {
+                for p in 0..planes {
                     let off = plane_offset(seed, bi, p, band.cells);
                     let pp = ((a * i as u64 + off) % band.cells as u64) as usize;
                     let bit = if pp < used && per_plane > 0 {
@@ -278,6 +279,7 @@ pub struct Calibration {
     /// are reported with zero confidence and rebuilt from cross-block parity -
     /// which is the whole reason a plane owns its codewords outright.
     pub dead: [bool; 3],
+    pub planes: usize,
 }
 
 /// Fit the ink model from the calibration lattice by least squares.
@@ -287,13 +289,12 @@ pub struct Calibration {
 /// scanner". The patches fade with the data, which is the whole point.
 pub fn calibrate(
     img: &Rgb,
-    geo_cols: usize,
+    planes: usize,
     patches: &[(usize, usize, u8)],
     plane_pos: &dyn Fn(usize, f64, f64) -> Point,
     white: WhiteMap,
     cell_px: f64,
 ) -> Option<Calibration> {
-    let _ = geo_cols;
     // Normal equations for D minimising |d - D s|^2 over patches.
     let mut sts = [[0.0f64; 3]; 3];
     let mut dst = [[0.0f64; 3]; 3];
@@ -325,8 +326,15 @@ pub fn calibrate(
         }
         n += 1;
     }
-    if n < 8 {
+    // Enough patches to determine the model: one per ink state, at least.
+    if n < (1usize << planes).max(4) {
         return None;
+    }
+    // With fewer than three inks the unused dimensions have no data, which
+    // leaves the normal equations singular. Pad them to the identity: those
+    // columns then solve to zero and are replaced with a nominal column below.
+    for j in planes..3 {
+        sts[j][j] = 1.0;
     }
     let sts_inv = invert3(&sts)?;
     // D = dst * sts^-1
@@ -337,16 +345,27 @@ pub fn calibrate(
         }
     }
     // A plane that has faded to nothing leaves a near-zero column, which would
-    // make the matrix singular and lose the two planes that are still fine. Give
-    // it a nominal column instead and mark it dead: the other planes decode, and
-    // this one's third of the blocks goes to parity.
+    // make the matrix singular and take the surviving planes down with it. Give
+    // it a nominal column instead and mark it dead, so its share of the blocks
+    // goes to parity while the rest decode normally.
+    //
+    // The bar is deliberately low. It exists to keep the matrix out of the
+    // singular region, not to judge readability: a weak plane is better tried and
+    // failed, because its codewords then become erasures and reach parity by a
+    // route that recovers the ink if it turns out to be legible. At a quarter of
+    // the strongest plane this was condemning a 30% faded ink that reads
+    // perfectly well, and spending a third of the archive's parity to do it.
+    //
+    // Planes this archive never used get the same nominal column, but are not
+    // "dead" - they were never alive.
     let norms: [f64; 3] =
         std::array::from_fn(|j| (0..3).map(|i| dmat[i][j] * dmat[i][j]).sum::<f64>().sqrt());
-    let strongest = norms.iter().cloned().fold(0.0f64, f64::max);
+    let strongest = norms[..planes].iter().cloned().fold(0.0f64, f64::max);
     let mut dead = [false; 3];
     for j in 0..3 {
-        if strongest <= 1e-6 || norms[j] < strongest * 0.25 {
-            dead[j] = true;
+        let unused = j >= planes;
+        if unused || strongest <= 1e-6 || norms[j] < strongest * 0.03 {
+            dead[j] = !unused;
             for i in 0..3 {
                 dmat[i][j] = if i == j { strongest.max(1.0) } else { 0.0 };
             }
@@ -357,6 +376,7 @@ pub fn calibrate(
         white,
         patches: n,
         dead,
+        planes,
     })
 }
 
@@ -492,6 +512,7 @@ impl PlaneWarp {
 
 /// `warped(cx, cy)` must give the black-ink image position of a cell centre,
 /// sync correction included.
+#[allow(clippy::too_many_arguments)]
 pub fn plane_warp(
     img: &Rgb,
     warped: &dyn Fn(f64, f64) -> Point,
@@ -499,6 +520,7 @@ pub fn plane_warp(
     rows: usize,
     f: usize,
     unit: usize,
+    planes: usize,
     cell_px: f64,
 ) -> Option<PlaneWarp> {
     let strips = reg_strips_for(cols, rows, f, unit);
@@ -506,7 +528,7 @@ pub fn plane_warp(
     let mut y0 = [0.0f64; 3];
     let mut y1 = [0.0f64; 3];
     let (mut x0, mut x1) = (0.0f64, 0.0f64);
-    for p in 0..3 {
+    for p in 0..planes {
         let ch = PLANE_CHANNEL[p];
         for (k, &(sx, sy)) in strips.iter().enumerate() {
             let (cx, cy) = reg_mark_centre(sx, sy, unit, p);
@@ -543,9 +565,10 @@ pub fn plane_warp(
     // after the subtraction is the quantity actually wanted: how far each ink
     // lands from the other two.
     for k in 0..4 {
-        let cx = (0..3).map(|p| delta[p][k].0).sum::<f64>() / 3.0;
-        let cy = (0..3).map(|p| delta[p][k].1).sum::<f64>() / 3.0;
-        for p in 0..3 {
+        let n = planes as f64;
+        let cx = (0..planes).map(|p| delta[p][k].0).sum::<f64>() / n;
+        let cy = (0..planes).map(|p| delta[p][k].1).sum::<f64>() / n;
+        for p in 0..planes {
             delta[p][k].0 -= cx;
             delta[p][k].1 -= cy;
         }
@@ -554,7 +577,7 @@ pub fn plane_warp(
     if (x1 - x0).abs() < 1.0 {
         return None;
     }
-    for p in 0..3 {
+    for p in 0..planes {
         if (y1[p] - y0[p]).abs() < 1.0 {
             return None;
         }

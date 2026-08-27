@@ -1574,7 +1574,13 @@ Stated plainly for planning purposes: **expect colour to roughly double capacity
 cost of the twenty-year archival promise.** That is a real gain and worth building. It is
 not a 4× gain, and no arrangement of the physics produces one.
 
-> **Built and measured.** Colour mode is implemented. In the software loop it reaches
+> **Built and measured.** Colour mode is implemented, in two variants: the specified
+> three-plane CMY, and a two-plane CM that omits yellow. Yellow is the least lightfast
+> ink and is read in the noisiest scanner channel, so dropping it trades a third of the
+> gain for the plane most likely to fail first — measured, `cm` is immune to blue-channel
+> noise and to yellow fade entirely. §18.1's argument against a fourth plane applies
+> unchanged; this is the same argument taken one step further.
+> In the software loop it reaches
 > **2.91–3.00×** at equal cell size and equal ECC — the top of the range above, because
 > the registration marks and calibration lattice cost only about 0.5% of cells. The
 > *expected* row still stands as the hardware prediction: measured blur tolerance is 0.30
