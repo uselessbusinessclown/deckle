@@ -291,3 +291,54 @@ that third: complete immunity to blue-channel noise and to yellow fade, and 0.6 
 0.4 tolerance of ink crosstalk, because there are two inks to separate rather than three.
 Yellow is the least lightfast ink in most sets and is read in the noisiest channel a
 scanner has, so it is the plane most likely to fail first in both storage and scanning.
+
+**4.16 A photograph of a page is not a plane, and that was the whole barrier.** The first
+real hardware test — a hand-held phone photo of a printed sheet, at 3.6 pixels per cell,
+with a shadow across half the page — decoded nothing at all. Nothing about that was
+resolution: a clean downsample to the same 3.6 px/cell reads with 0.02% cell errors.
+
+Measuring the true local offset by correlating patches against the printed pattern showed
+what was happening. The four corners fitted a homography perfectly, and the required
+offset in the *middle* of the page ran from −7 to +7.5 cells, varying smoothly. Paper curl
+and lens distortion together, and a homography maps a plane. The decoder searched ±1.1
+cells around the prediction, so it locked onto whatever was there — the sampled cells were
+statistically uncorrelated with the printed ones, 47% wrong, black and white confused
+symmetrically.
+
+The fix is to stop assuming the corner fit is sub-cell accurate everywhere. Sync marks are
+now tracked outward from the corners by region growing, each one predicted from the
+neighbours already found, so every search stays local however far the page has wandered.
+Predicting by *extrapolating the gradient* rather than copying a neighbour matters: the
+warp has a slope of over a cell per step in places, and a prediction that ignores it falls
+behind, loses lock, and takes the rest of the page with it.
+
+Three tuning results, each measured rather than guessed:
+
+- **Reject aggressively.** A rejected sync mark leaves a hole its neighbours interpolate
+  across, which is nearly free on a smooth field. An accepted *wrong* mark derails the
+  growth. Raising the acceptance bar from 0.55 to 1.2 local standard deviations took the
+  recovered blocks from 78 to 167 and the cell error from 13% to 1.5% — and improved fold
+  tolerance at the same time.
+- **A global surface fit is worse than local growth.** A quadratic in the page
+  coordinates, with outlier rejection, seemed the principled model for curl plus lens
+  distortion. It made things worse — 15% to 26% — because the real field has more
+  structure than six coefficients, and the fit gets dragged by the region that is already
+  wrong.
+- **Close the sampling aperture.** At 6 px/cell the synthetic degradations cannot tell
+  +/-0.13 cell from +/-0.08. At 3.6 px/cell on real paper they are not the same thing at
+  all: the wider aperture reaches into the neighbouring cells. That single change was the
+  difference between four blocks short and a byte-identical recovery.
+
+The result: **a hand-held phone photograph of an A4 sheet at 254 um now decodes
+byte-identically** — 144 blocks read directly, 27 rebuilt from cross-block parity, hash
+verified, correctly reported as *recovered with difficulty*. The mean page warp was 7.5
+cells; a flatbed reads 0.2.
+
+This is the first thing in the project measured on real paper rather than in a software
+loop, and it moved a design assumption: PLAN.md routes phone cameras to QR and the dense
+grid to a scanner (§3). That is still the right default — this photo needed the whole
+error-correction budget and the parity on top — but the grid is no longer scanner-only.
+
+Fold tolerance did regress, 32 to 24 lines, as the cost of tracking large warps. That is
+the right trade: 24 folds is far outside anything a stored sheet sees, and pages that are
+not flat are the normal case for a camera.

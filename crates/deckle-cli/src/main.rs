@@ -545,7 +545,14 @@ fn cmd_inspect(o: &Opts) -> Result<(), String> {
             "Worst margin       {:.0}% of capacity",
             d.worst_margin * 100.0
         );
-        println!("Geometry residual  {:.3} cells", d.geometry_residual);
+        println!(
+            "Page warp          {:.2} cells mean, from {} of {} sync marks",
+            d.geometry_residual, d.sync_tracked.0, d.sync_tracked.1
+        );
+        if d.geometry_residual > 1.0 {
+            println!("                   (large - a photograph of a page that is not flat,");
+            println!("                    or lens distortion. A flatbed scan reads near zero.)");
+        }
         if let Some(reg) = d.plane_registration {
             let m = d.plane_margin.unwrap_or([0.0; 3]);
             let dead = d.dead_planes.unwrap_or([false; 3]);

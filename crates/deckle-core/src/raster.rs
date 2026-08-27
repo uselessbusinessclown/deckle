@@ -255,8 +255,12 @@ pub struct PageDecode {
     pub mirrored: bool,
     pub worst_margin: f64,
     pub mean_margin: f64,
-    /// Residual of the sync-mark fit, in cells. High values mean bad geometry.
+    /// Mean displacement of the tracked sync marks from the corner-fitted
+    /// geometry, in cells. Near zero on a flatbed; several cells on a photograph
+    /// of a page that is not perfectly flat.
     pub geometry_residual: f64,
+    /// Sync marks tracked, and how many there are.
+    pub sync_tracked: (usize, usize),
 }
 
 #[derive(Debug)]
@@ -331,9 +335,11 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
     let mut found = None;
     for (tl, tr, bl, unit_px) in orient_candidates(&finders) {
         let br_pred = Point::new(tr.x + bl.x - tl.x, tr.y + bl.y - tl.y);
-        let Some(br) = locate_br(img, &integral, br_pred, unit_px) else {
-            continue;
-        };
+        // If the marker cannot be found, still try the parallelogram prediction:
+        // it is accurate on a flat page, and the descriptor's own CRC is the
+        // real verifier, so a wrong corner simply fails to decode and the next
+        // candidate is tried. Refusing to look was costing readable pages.
+        let br = locate_br(img, &integral, br_pred, unit_px).unwrap_or(br_pred);
         let Some(h) = Homography::from_four(&uv, &[tl, tr, bl, br]) else {
             continue;
         };
@@ -371,25 +377,128 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
         )
     };
 
-    // Local warp: measure each sync mark's true position and interpolate between.
+    // Local warp, tracked outward from the corners.
+    //
+    // A single homography maps a plane. A page photographed by hand is not one:
+    // paper curl and lens distortion together displaced the true cell positions
+    // by up to seven cells on a real photograph, while the corners still fitted
+    // perfectly. Searching a fixed window around the homography's prediction
+    // cannot follow that - so instead each sync mark is predicted from the
+    // neighbours already found, which keeps every search local no matter how far
+    // the page has wandered by the far corner.
     let marks = sync_marks_ink(cols, rows, f, unit, ink);
     let nx = cols.div_ceil(SYNC_PERIOD);
     let ny = rows.div_ceil(SYNC_PERIOD);
-    let mut disp = vec![None; nx * ny];
-    let mut resid_sum = 0.0;
-    let mut resid_n = 0usize;
+    let mut disp: Vec<Option<(f64, f64)>> = vec![None; nx * ny];
+    let mut node_at: Vec<Option<(usize, usize)>> = vec![None; nx * ny];
     for &(bx, by) in &marks {
-        let pred = h_uv2img.apply(cell_uv((bx + 2) as f64, (by + 2) as f64));
-        if let Some(found) = refine_dark(img, pred, cell_px * 1.1) {
-            let d = (found.x - pred.x, found.y - pred.y);
-            let mag = (d.0 * d.0 + d.1 * d.1).sqrt() / cell_px.max(1e-9);
-            if mag < 1.5 {
-                disp[(by / SYNC_PERIOD) * nx + bx / SYNC_PERIOD] = Some(d);
-                resid_sum += mag;
-                resid_n += 1;
+        node_at[(by / SYNC_PERIOD) * nx + bx / SYNC_PERIOD] = Some((bx, by));
+    }
+    let predict = |bx: usize, by: usize| h_uv2img.apply(cell_uv((bx + 2) as f64, (by + 2) as f64));
+
+    // Seed from the nodes nearest each corner, where the homography is exact.
+    let mut queue: std::collections::VecDeque<usize> = Default::default();
+    let mut seeded = 0usize;
+    for &(gx, gy) in &[(0usize, 0usize), (nx - 1, 0), (0, ny - 1), (nx - 1, ny - 1)] {
+        // Walk inward until a node exists there (the corners are reserved).
+        for r in 0..6 {
+            let mut done = false;
+            for dy in 0..=r {
+                for dx in 0..=r {
+                    let (ix, iy) = (
+                        if gx == 0 {
+                            gx + dx
+                        } else {
+                            gx.saturating_sub(dx)
+                        },
+                        if gy == 0 {
+                            gy + dy
+                        } else {
+                            gy.saturating_sub(dy)
+                        },
+                    );
+                    let i = iy * nx + ix;
+                    if disp[i].is_some() {
+                        continue;
+                    }
+                    if let Some((bx, by)) = node_at[i] {
+                        let p0 = predict(bx, by);
+                        if let Some(q) = locate_sync(img, &integral, p0, cell_px, cell_px * 2.5) {
+                            disp[i] = Some((q.x - p0.x, q.y - p0.y));
+                            queue.push_back(i);
+                            seeded += 1;
+                            done = true;
+                        }
+                    }
+                }
+            }
+            if done {
+                break;
             }
         }
     }
+    let _ = seeded;
+
+    while let Some(i) = queue.pop_front() {
+        let (gx, gy) = (i % nx, i / nx);
+        for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+            let (jx, jy) = (gx as i32 + dx, gy as i32 + dy);
+            if jx < 0 || jy < 0 || jx >= nx as i32 || jy >= ny as i32 {
+                continue;
+            }
+            let j = jy as usize * nx + jx as usize;
+            if disp[j].is_some() {
+                continue;
+            }
+            let Some((bx, by)) = node_at[j] else { continue };
+            // Predict by extrapolating along the direction of travel, not by
+            // averaging neighbours. The warp has a slope - up to a cell and a
+            // half per step across this page - and a prediction that ignores it
+            // falls behind, loses lock, and takes the whole downstream region
+            // with it. Two points back give the gradient; one gives only a
+            // guess that is always late.
+            let Some(d_here) = disp[i] else { continue };
+            let (px2, py2) = (jx - 2 * dx, jy - 2 * dy);
+            let guess = if px2 >= 0
+                && py2 >= 0
+                && px2 < nx as i32
+                && py2 < ny as i32
+                && disp[py2 as usize * nx + px2 as usize].is_some()
+            {
+                let d_prev = disp[py2 as usize * nx + px2 as usize].unwrap();
+                // Bounded extrapolation. Unbounded, a bad lock feeds the next
+                // prediction and the field runs away - it reached four hundred
+                // cells before this clamp.
+                let lim = cell_px * 2.0;
+                (
+                    d_here.0 + (d_here.0 - d_prev.0).clamp(-lim, lim),
+                    d_here.1 + (d_here.1 - d_prev.1).clamp(-lim, lim),
+                )
+            } else {
+                d_here
+            };
+            let p0 = predict(bx, by);
+            let from = Point::new(p0.x + guess.0, p0.y + guess.1);
+            if let Some(q) = locate_sync(img, &integral, from, cell_px, cell_px * 2.2) {
+                let d = (q.x - p0.x, q.y - p0.y);
+                // The field is smooth, so a step of more than a couple of cells
+                // between adjacent marks is a mislock, not a measurement.
+                let step = ((d.0 - d_here.0).powi(2) + (d.1 - d_here.1).powi(2)).sqrt();
+                if step < cell_px * 3.0 {
+                    disp[j] = Some(d);
+                    queue.push_back(j);
+                }
+            }
+        }
+    }
+
+    let resid_n = disp.iter().filter(|d| d.is_some()).count();
+    let resid_sum: f64 = disp
+        .iter()
+        .flatten()
+        .map(|d| (d.0 * d.0 + d.1 * d.1).sqrt() / cell_px.max(1e-9))
+        .sum();
+
     let geometry_residual = if resid_n > 0 {
         resid_sum / resid_n as f64
     } else {
@@ -608,18 +717,20 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
         worst_margin: worst,
         mean_margin: mean,
         geometry_residual,
+        sync_tracked: (resid_n, marks.len()),
     })
 }
 
 /// Mean of the central part of a cell, avoiding the edges where dot gain and
 /// scanner MTF do their damage, plus the spread across those samples.
 ///
-/// PLAN.md 5.8 proposed the central 50%. Measured against the blur and dot-gain
-/// models, a tighter aperture is better: at 0.4-cell blur the worst-case
-/// correction margin drops from 66% to 44% of capacity going from +/-0.18 to
-/// +/-0.13 cell. Narrower still gains nothing and costs noise immunity.
+/// PLAN.md 5.8 proposed the central 50%. Measured, much tighter is better. The
+/// synthetic degradations are indifferent between +/-0.13 and +/-0.08 cell, but
+/// a real photograph at 3.6 pixels per cell is not: the wider aperture reaches
+/// into the neighbours, and closing it was the difference between four blocks
+/// short and a byte-identical recovery.
 pub(crate) fn sample_cell(img: &Gray, px: f64, py: f64, cell_px: f64) -> (f64, f64) {
-    let o = cell_px * 0.13;
+    let o = cell_px * 0.08;
     let pts = [(0.0, 0.0), (-o, -o), (o, -o), (-o, o), (o, o)];
     let mut vs = [0.0f64; 5];
     for (i, (dx, dy)) in pts.iter().enumerate() {
@@ -650,14 +761,56 @@ fn read_descriptor(
         (DESC_BLOCK_COLS as f64 - m, DESC_BLOCK_ROWS as f64 - m),
     ];
     let ds_px = du * span_x;
-    let mut dst = [Point::new(0.0, 0.0); 4];
-    for (i, &(cx, cy)) in nominal.iter().enumerate() {
-        let pred = h.apply(Point::new(cx * du, top + cy * dv));
-        dst[i] = refine_dark(img, pred, ds_px * 2.5).unwrap_or(pred);
-    }
     let src = nominal.map(|(x, y)| Point::new(x, y));
-    let hs = Homography::from_four(&src, &dst)?;
+    let predict = |cx: f64, cy: f64| h.apply(Point::new(cx * du, top + cy * dv));
 
+    // Two ways to place the strip's corner markers, tried in turn. The matched
+    // search is much better when the first prediction is well off, as it is on a
+    // photograph; the plain centroid is better when the marker is clean and the
+    // prediction is already close. Whichever produces a descriptor that passes
+    // its CRC is the right one, so simply try both.
+    let mut hs = None;
+    for strategy in 0..2 {
+        let mut dst = [Point::new(0.0, 0.0); 4];
+        for (i, &(cx, cy)) in nominal.iter().enumerate() {
+            let p = predict(cx, cy);
+            dst[i] = if strategy == 0 {
+                locate_solid(img, integral, p, ds_px * 1.5, ds_px * 3.5).unwrap_or(p)
+            } else {
+                refine_dark(img, p, ds_px * 2.5).unwrap_or(p)
+            };
+        }
+        let Some(mut m) = Homography::from_four(&src, &dst) else {
+            continue;
+        };
+        if strategy == 0 {
+            // Once there is a strip homography it predicts its own markers far
+            // better than an extrapolation from the page corners can, so
+            // re-locate from it and refit.
+            for _ in 0..2 {
+                for i in 0..4 {
+                    let p = m.apply(src[i]);
+                    if let Some(q) = locate_solid(img, integral, p, ds_px * 1.5, ds_px * 1.5) {
+                        dst[i] = q;
+                    }
+                }
+                let Some(m2) = Homography::from_four(&src, &dst) else {
+                    break;
+                };
+                m = m2;
+            }
+        }
+        if let Some(d) = read_strip(img, integral, &m, ds_px) {
+            return Some(d);
+        }
+        hs = Some(m);
+    }
+    let _ = hs;
+    None
+}
+
+/// Sample the descriptor strip through a fitted homography and decode it.
+fn read_strip(img: &Gray, integral: &Integral, hs: &Homography, ds_px: f64) -> Option<Descriptor> {
     let mut cw = vec![0u8; RS_N];
     let mut wh = Whitener::new(WHITEN_SEED_DESC);
     let half = (ds_px * 1.5).max(2.0);
@@ -679,6 +832,105 @@ fn read_descriptor(
     }
     rs_decode(&mut cw, RS_N - DESC_RS_K, &[]).ok()?;
     Descriptor::from_message(&cw[..DESC_RS_K])
+}
+
+/// Find a sync mark: a two-cell dark core inside a four-cell block that is
+/// otherwise white. Scoring the contrast between core and surround, rather than
+/// darkness alone, is what separates it from the random dark clusters that
+/// payload cells throw up constantly.
+pub(crate) fn locate_sync(
+    img: &Gray,
+    integral: &Integral,
+    at: Point,
+    cell_px: f64,
+    search: f64,
+) -> Option<Point> {
+    let half = cell_px * 0.9;
+    let ring_r = cell_px * 1.5;
+    let step = (cell_px * 0.25).max(0.5);
+    let score_at = |p: Point| -> Option<f64> {
+        if p.x < ring_r
+            || p.y < ring_r
+            || p.x + ring_r >= img.w as f64
+            || p.y + ring_r >= img.h as f64
+        {
+            return None;
+        }
+        let (core, _) = integral.stats(p.x, p.y, half);
+        let mut ring = 0.0;
+        for k in 0..8 {
+            let th = std::f64::consts::TAU * k as f64 / 8.0;
+            ring += img.sample(p.x + ring_r * th.cos(), p.y + ring_r * th.sin());
+        }
+        Some(ring / 8.0 - core)
+    };
+    let mut best: Option<(f64, Point)> = None;
+    let mut dy = -search;
+    while dy <= search {
+        let mut dx = -search;
+        while dx <= search {
+            let p = Point::new(at.x + dx, at.y + dy);
+            if let Some(sc) = score_at(p) {
+                if best.map_or(true, |(bs, _)| sc > bs) {
+                    best = Some((sc, p));
+                }
+            }
+            dx += step;
+        }
+        dy += step;
+    }
+    let (sc, p) = best?;
+    // A real mark stands well clear of its surround; random ink does not. The
+    // bar has to scale with local contrast, though: in a shadowed corner of a
+    // photograph everything is compressed, and a fixed threshold stops the
+    // search dead exactly where the page is hardest to read.
+    let (_, sd) = integral.stats(p.x, p.y, cell_px * 4.0);
+    // Set high on purpose. A rejected mark leaves a hole that its neighbours
+    // interpolate across, which is nearly free on a smooth field; an accepted
+    // *wrong* mark derails the growth and takes the rest of the page with it.
+    // Measured on a real photograph, raising this bar from 0.55 to 1.2 took the
+    // recovered blocks from 78 to 167 and the cell error from 13% to 1.5%.
+    if sc < (sd * 1.2).max(8.0) {
+        return None;
+    }
+    Some(p)
+}
+
+/// Find a solid dark square of known size near a predicted position.
+///
+/// A plain darkness centroid is not enough when the square has payload cells
+/// immediately beside it, as the descriptor strip's corner markers do: any
+/// window wide enough to hold the marker also holds data, and the data drags the
+/// centroid. Searching for the *darkest box of the marker's own size* locks on
+/// instead - a solid marker averages near black where half-inked payload
+/// averages mid-grey - and only then is the centroid taken, inside that box.
+pub(crate) fn locate_solid(
+    img: &Gray,
+    integral: &Integral,
+    at: Point,
+    half: f64,
+    search: f64,
+) -> Option<Point> {
+    let step = (half / 3.0).max(1.0);
+    let mut best: Option<(f64, Point)> = None;
+    let mut dy = -search;
+    while dy <= search {
+        let mut dx = -search;
+        while dx <= search {
+            let p = Point::new(at.x + dx, at.y + dy);
+            if p.x >= half && p.y >= half && p.x + half < img.w as f64 && p.y + half < img.h as f64
+            {
+                let (m, _) = integral.stats(p.x, p.y, half);
+                if best.map_or(true, |(bm, _)| m < bm) {
+                    best = Some((m, p));
+                }
+            }
+            dx += step;
+        }
+        dy += step;
+    }
+    let (_, p) = best?;
+    Some(refine_dark(img, p, half).unwrap_or(p))
 }
 
 /// Darkness-weighted centroid inside a window; `None` if the window is blank.
@@ -976,7 +1228,11 @@ fn locate_br(img: &Gray, integral: &Integral, at: Point, unit: f64) -> Option<Po
     // gradient scales the whole neighbourhood, so a fixed brightness threshold
     // would reject a perfectly good marker in a dim corner of the scan.
     let ring = ring_mean(img, p, unit)?;
-    if ring - core < 90.0 || core > ring * 0.45 {
+    // Both tests are relative to the local white level, with nothing absolute in
+    // them. A photograph of a real sheet can have half the page in shadow: at a
+    // local white of 120 a perfectly good marker reads about 60, and a fixed
+    // 90-grey-level contrast requirement threw that away.
+    if ring < 40.0 || core > ring * 0.55 || ring - core < ring * 0.25 {
         return None;
     }
     Some(refine_dark(img, p, unit * 3.0).unwrap_or(p))

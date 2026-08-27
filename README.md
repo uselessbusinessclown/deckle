@@ -86,6 +86,7 @@ the same thing at any density.
 | Stain | 40% of page width | — | — |
 | Missing full-width strip | 10% of page height | — | — |
 | Rotation, mirroring | any angle, either handedness | same | same |
+| Page warp (curl, lens distortion) | 7.5 cells, measured on a real photo | — | — |
 | A whole sheet destroyed | yes, at sufficient parity | same | same |
 | Ink crosstalk (non-ideal inks) | — | 0.6 | 0.4 |
 | Per-plane misregistration | — | 0.6 cells | 0.6 cells |

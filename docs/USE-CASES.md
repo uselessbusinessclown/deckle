@@ -111,8 +111,10 @@ format reserves a field, but the tool does not implement it. **Encrypt before yo
 A paper backup of a plaintext seed phrase or password database is a bearer instrument:
 whoever handles it has it.
 
-**Phone cameras cannot read the dense grid.** A flatbed scanner reads data sheets; a phone
-reads the bootstrap page. Confirm a scanner will be available before you rely on this.
+**A flatbed scanner is the right way to read data sheets.** A phone photograph of an A4
+sheet at 254 um does now decode — the decoder tracks page curl and lens distortion — but
+it consumed the whole error-correction budget and the parity as well. Treat it as the
+fallback, not the plan, and confirm a scanner will be available before you rely on this.
 
 **No hardware measurement has been made.** Every capacity figure here comes from a
 software loop. The printer-and-scanner testing that would confirm the density tiers —
