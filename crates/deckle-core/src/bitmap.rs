@@ -200,6 +200,20 @@ impl Rgb {
         let d = self.get(x1, y1)[ch] as f64;
         a * (1.0 - fx) * (1.0 - fy) + b * fx * (1.0 - fy) + c * (1.0 - fx) * fy + d * fx * fy
     }
+    /// The brightest channel at each pixel: how much ink is *absent*.
+    ///
+    /// This is what structural black is found in. Black blocks all three
+    /// channels; every cyan/magenta combination leaves at least one wide open.
+    pub fn to_max_channel(&self) -> Gray {
+        let mut g = Gray::new(self.w, self.h, 255);
+        for i in 0..self.w * self.h {
+            g.px[i] = self.px[i * 3]
+                .max(self.px[i * 3 + 1])
+                .max(self.px[i * 3 + 2]);
+        }
+        g
+    }
+
     pub fn to_luma(&self) -> Gray {
         let mut g = Gray::new(self.w, self.h, 255);
         for i in 0..self.w * self.h {
@@ -246,28 +260,43 @@ impl Rgb {
     }
 }
 
-/// A scanned page. Colour is optional: a mono archive needs only luminance, and
-/// a colour archive scanned in greyscale must be refused rather than guessed at.
+/// A scanned page. Colour is optional: a mono archive needs only one channel,
+/// and a colour archive scanned in greyscale must be refused, not guessed at.
 pub struct Scan {
-    pub luma: Gray,
+    /// The image structure is located in: corner markers, sync marks and the
+    /// descriptor strip, all of which are printed in black.
+    ///
+    /// Luminance, including for a colour scan.
+    ///
+    /// `max(R, G, B)` looks like the better choice for colour, since in the
+    /// ideal print model black blocks every channel and no cyan-magenta
+    /// combination does. Measured on a real print it buys nothing - structural
+    /// black read (20,16,14) and the darkest payload (0,0,9), both effectively
+    /// black in every channel - and it costs something real: taking the
+    /// brightest channel makes structure detection maximally sensitive to noise
+    /// in the channel that carries no data.
+    pub structure: Gray,
     pub rgb: Option<Rgb>,
 }
 
 impl Scan {
     pub fn grey(g: Gray) -> Scan {
-        Scan { luma: g, rgb: None }
+        Scan {
+            structure: g,
+            rgb: None,
+        }
     }
     pub fn colour(c: Rgb) -> Scan {
         Scan {
-            luma: c.to_luma(),
+            structure: c.to_luma(),
             rgb: Some(c),
         }
     }
     pub fn mirrored(&self) -> Scan {
-        let mut luma = Gray::new(self.luma.w, self.luma.h, 255);
-        for y in 0..self.luma.h {
-            for x in 0..self.luma.w {
-                luma.set(self.luma.w - 1 - x, y, self.luma.get(x, y));
+        let mut structure = Gray::new(self.structure.w, self.structure.h, 255);
+        for y in 0..self.structure.h {
+            for x in 0..self.structure.w {
+                structure.set(self.structure.w - 1 - x, y, self.structure.get(x, y));
             }
         }
         let rgb = self.rgb.as_ref().map(|c| {
@@ -279,7 +308,7 @@ impl Scan {
             }
             o
         });
-        Scan { luma, rgb }
+        Scan { structure, rgb }
     }
 
     /// Read a page, keeping colour when the file has it.

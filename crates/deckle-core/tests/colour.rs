@@ -301,6 +301,6 @@ fn black_and_colour_pages_do_not_decode_as_each_other() {
     assert_eq!(mono.pages[0].descriptor.format_version, 0x0100);
     assert_eq!(col.pages[0].descriptor.format_version, 0x0110);
     // A colour page rendered to greyscale is not a mono page.
-    let flat = col.pages[0].render(&col.plan.geo).luma;
+    let flat = col.pages[0].render(&col.plan.geo).structure;
     assert!(raster::decode_page(&flat).is_err());
 }

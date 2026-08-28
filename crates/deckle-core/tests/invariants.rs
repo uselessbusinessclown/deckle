@@ -39,7 +39,7 @@ fn round_trip(cfg: &Config, files: &[FileEntry], deg: &Degradation, drop: &[usiz
         if drop.contains(&i) {
             continue;
         }
-        let img = apply(&p.render(geo).luma, deg, geo.cell_dots as f64);
+        let img = apply(&p.render(geo).structure, deg, geo.cell_dots as f64);
         match raster::decode_page(&img) {
             Ok(d) => decoded.push(d),
             Err(e) => failed.push(format!("page {}: {e}", i + 1)),
@@ -251,7 +251,7 @@ fn rejects_pages_from_another_document() {
     let geo = &a.plan.geo;
     let mut pages = Vec::new();
     for src in [&a.pages[0], &b.pages[0]] {
-        let img = src.render(geo).luma;
+        let img = src.render(geo).structure;
         pages.push(raster::decode_page(&img).expect("decode"));
     }
     let err = doc::reassemble(pages).expect_err("mixed documents must be refused");
@@ -280,7 +280,7 @@ fn descriptor_carries_everything_the_decoder_needs() {
         let c = cfg(cell, ecc, 0.2);
         let files = payload(4_000, cell as u64);
         let enc = doc::encode(&c, &files).unwrap();
-        let img = enc.pages[0].render(&enc.plan.geo).luma;
+        let img = enc.pages[0].render(&enc.plan.geo).structure;
         let d = raster::decode_page(&img).expect("decode");
         assert_eq!(d.descriptor.rs_k as usize, ecc.k());
         assert_eq!(d.descriptor.grid_cols as usize, enc.plan.geo.cols);
@@ -321,7 +321,7 @@ fn pdf_cross_reference_table_is_correct() {
     let c = cfg(254, Ecc::Q, 0.0);
     let enc = doc::encode(&c, &payload(20_000, 10)).unwrap();
     let geo = &enc.plan.geo;
-    let imgs: Vec<_> = enc.pages.iter().map(|p| p.render(geo).luma).collect();
+    let imgs: Vec<_> = enc.pages.iter().map(|p| p.render(geo).structure).collect();
     assert!(imgs.len() >= 2, "want a multi-page PDF");
     let pages: Vec<deckle_core::pdf::Page> = imgs
         .iter()

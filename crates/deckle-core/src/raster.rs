@@ -319,8 +319,9 @@ pub fn decode_scan(scan: &Scan) -> Result<PageDecode, DecodeError> {
 }
 
 fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeError> {
-    let img = &scan.luma;
+    let img = &scan.structure;
     let thr = otsu(img);
+    let white = white_level(img);
     let finders = find_finders(img, thr);
     if finders.len() < 3 {
         return Err(DecodeError::NoFinders(finders.len()));
@@ -423,7 +424,9 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
                     }
                     if let Some((bx, by)) = node_at[i] {
                         let p0 = predict(bx, by);
-                        if let Some(q) = locate_sync(img, &integral, p0, cell_px, cell_px * 2.5) {
+                        if let Some(q) =
+                            locate_sync(img, &integral, p0, cell_px, cell_px * 2.5, white)
+                        {
                             disp[i] = Some((q.x - p0.x, q.y - p0.y));
                             queue.push_back(i);
                             seeded += 1;
@@ -479,7 +482,7 @@ fn decode_oriented(scan: &Scan, mirrored: bool) -> Result<PageDecode, DecodeErro
             };
             let p0 = predict(bx, by);
             let from = Point::new(p0.x + guess.0, p0.y + guess.1);
-            if let Some(q) = locate_sync(img, &integral, from, cell_px, cell_px * 2.2) {
+            if let Some(q) = locate_sync(img, &integral, from, cell_px, cell_px * 2.2, white) {
                 let d = (q.x - p0.x, q.y - p0.y);
                 // The field is smooth, so a step of more than a couple of cells
                 // between adjacent marks is a mislock, not a measurement.
@@ -844,6 +847,7 @@ pub(crate) fn locate_sync(
     at: Point,
     cell_px: f64,
     search: f64,
+    white: f64,
 ) -> Option<Point> {
     let half = cell_px * 0.9;
     let ring_r = cell_px * 1.5;
@@ -880,17 +884,25 @@ pub(crate) fn locate_sync(
         dy += step;
     }
     let (sc, p) = best?;
-    // A real mark stands well clear of its surround; random ink does not. The
-    // bar has to scale with local contrast, though: in a shadowed corner of a
-    // photograph everything is compressed, and a fixed threshold stops the
-    // search dead exactly where the page is hardest to read.
-    let (_, sd) = integral.stats(p.x, p.y, cell_px * 4.0);
-    // Set high on purpose. A rejected mark leaves a hole that its neighbours
-    // interpolate across, which is nearly free on a smooth field; an accepted
-    // *wrong* mark derails the growth and takes the rest of the page with it.
-    // Measured on a real photograph, raising this bar from 0.55 to 1.2 took the
+    // Two bars, and a mark must clear both.
+    //
+    // What identifies a sync mark is not that its core is dark. On a colour page
+    // the cyan-magenta overprint is as dark as black ink - measured on a real
+    // print, structural black read (20,16,14) and the darkest payload (0,0,9) -
+    // so no darkness test separates them. What is distinctive is that the mark
+    // sits in twelve cells of bare paper, which random payload essentially never
+    // produces. So the primary bar is a fraction of the full paper-to-ink swing.
+    //
+    // The local standard deviation is kept as a second bar because it adapts to a
+    // shadowed corner, where everything is compressed and an absolute threshold
+    // would stop the search exactly where the page is hardest to read. Set high
+    // on purpose: a rejected mark leaves a hole its neighbours interpolate
+    // across, which is nearly free on a smooth field, while an accepted *wrong*
+    // one derails the region growing and takes the rest of the page with it.
+    // Measured on a real photograph, raising it from 0.55 to 1.2 took the
     // recovered blocks from 78 to 167 and the cell error from 13% to 1.5%.
-    if sc < (sd * 1.2).max(8.0) {
+    let (_, sd) = integral.stats(p.x, p.y, cell_px * 4.0);
+    if sc < (sd * 1.2).max(8.0) || sc < white * 0.35 {
         return None;
     }
     Some(p)
@@ -972,6 +984,24 @@ pub(crate) fn refine_dark(img: &Gray, at: Point, radius: f64) -> Option<Point> {
         return None;
     }
     Some(Point::new(sx / sw + 0.5, sy / sw + 0.5))
+}
+
+/// Paper white, as a high percentile of the page. Robust to the ink covering
+/// most of it and to a scan that is not brightly lit.
+fn white_level(img: &Gray) -> f64 {
+    let mut hist = [0u64; 256];
+    for &p in &img.px {
+        hist[p as usize] += 1;
+    }
+    let cut = (img.px.len() as f64 * 0.92) as u64;
+    let mut acc = 0u64;
+    for (v, &n) in hist.iter().enumerate() {
+        acc += n;
+        if acc >= cut {
+            return v as f64;
+        }
+    }
+    255.0
 }
 
 fn otsu(img: &Gray) -> u8 {

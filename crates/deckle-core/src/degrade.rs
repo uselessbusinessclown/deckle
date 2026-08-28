@@ -387,7 +387,7 @@ pub fn apply_scan(scan: &Scan, d: &Degradation, cell_px: f64) -> Scan {
 /// As `apply_scan`, told where black ink is so that ink fade leaves it alone.
 pub fn apply_scan_masked(scan: &Scan, black: Option<&Gray>, d: &Degradation, cell_px: f64) -> Scan {
     match &scan.rgb {
-        None => Scan::grey(apply(&scan.luma, d, cell_px)),
+        None => Scan::grey(apply(&scan.structure, d, cell_px)),
         Some(c) => {
             let dirty = apply_colour(c, black, d, cell_px);
             if d.greyscale {

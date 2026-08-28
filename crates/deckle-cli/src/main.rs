@@ -293,7 +293,7 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
         let (scan, black) = p.render_masked(geo);
         for_pdf.push(match (&scan.rgb, &black) {
             (Some(rgb), Some(k)) => pdf::Page::indexed_cmyk(rgb, k),
-            _ => pdf::Page::Mono(scan.luma.clone()),
+            _ => pdf::Page::Mono(scan.structure.clone()),
         });
         rendered.push(scan);
     }
@@ -314,7 +314,7 @@ fn cmd_encode(o: &Opts) -> Result<(), String> {
             let path = out.join(format!("page-{:03}.png", i + 1));
             match &s.rgb {
                 Some(c) => c.write_png(&path),
-                None => s.luma.write_png(&path),
+                None => s.structure.write_png(&path),
             }
             .map_err(|e| format!("{}: {e}", path.display()))?;
         }
@@ -460,7 +460,7 @@ fn cmd_decode(o: &Opts) -> Result<(), String> {
 
 fn cmd_inspect(o: &Opts) -> Result<(), String> {
     let scan = Scan::read_png(&o.inputs[0]).map_err(|e| e.to_string())?;
-    let img = &scan.luma;
+    let img = &scan.structure;
     if o.verbose {
         let p = raster::probe(img);
         println!("Image              {} x {} px", img.w, img.h);

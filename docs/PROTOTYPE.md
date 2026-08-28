@@ -342,3 +342,38 @@ error-correction budget and the parity on top — but the grid is no longer scan
 Fold tolerance did regress, 32 to 24 lines, as the cost of tracking large warps. That is
 the right trade: 24 folds is far outside anything a stored sheet sees, and pages that are
 not flat are the normal case for a camera.
+
+**4.17 Second hardware test: colour on a good capture still fails, and the reason is
+chromatic.** A `cm` sheet at 254 um, photographed flat, evenly lit, at 24.5 Mpx — better
+than the first test in every respect — does not decode. The diagnosis is worth recording
+because almost every plausible explanation turned out to be wrong:
+
+- *Not resolution.* 5 pixels per cell, against 3.6 for the mono sheet that worked.
+- *Not the warp.* It is large — 15 cells mean, which at 1.5% of the frame is textbook
+  lens barrel distortion rather than curl — but the region growing tracks it. Forcing the
+  warp to zero takes the cell error from 15% to 50%, so the tracking is doing real work.
+- *Not dot gain.* A quarter of `cm` cells carry no ink, and the print measures 24% bare
+  paper. The ink went down faithfully.
+- *Not the sampling aperture.* Sweeping it moves the error by half a point.
+- *Not structural black being confused with dark payload*, though that looked certain
+  from the ideal print model. Measured, structural black reads (20,16,14) and the darkest
+  payload (0,0,9): both effectively black in every channel, so `max(R,G,B)` separates
+  nothing. It also costs robustness, since taking the brightest channel makes structure
+  detection maximally sensitive to noise in the channel carrying no data.
+
+What is left fits the evidence exactly. The residual error grows **radially**, 6.5% at the
+page centre to 42% at a corner, and it is consistently worse for magenta (24%) than cyan
+(15%) — different channels, different amounts. That is **lateral chromatic aberration**:
+the lens focuses red and green at slightly different magnifications, so each ink plane
+needs its own warp field. Deckle currently tracks one field, in luminance, and corrects
+each plane with a bilinear fitted to four corner marks — which cannot represent a radial
+per-channel difference.
+
+**The fix is to track the warp per channel**, running the same region growing three times
+over R, G and B. The sync marks are black, so they appear in every channel and are equally
+findable in each; the result would absorb chromatic aberration exactly. That is the next
+piece of decoder work, and it is what would make colour readable from a camera.
+
+Two things this does not change. A flatbed has no chromatic aberration worth the name, so
+colour on a scanner is unaffected. And the mono path is unaffected: the same photograph
+pipeline reads a black sheet byte-identically.
